@@ -1,0 +1,16 @@
+# Secrets - NEVER commit real config
+firmware/include/config.h
+
+# PlatformIO build
+firmware/.pio/
+firmware/.vscode/
+
+# OpenSCAD generated
+enclosure/*.stl
+enclosure/*.off
+enclosure/*.amf
+enclosure/*.3mf
+
+# OS
+.DS_Store
+Thumbs.db

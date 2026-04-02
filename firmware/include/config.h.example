@@ -1,0 +1,52 @@
+#pragma once
+
+// ===== WiFi =====
+#define WIFI_SSID     "YOUR_WIFI_SSID"
+#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+
+// ===== GitHub =====
+#define GITHUB_TOKEN  "ghp_YOUR_PERSONAL_ACCESS_TOKEN"
+#define GITHUB_OWNER  "YOUR_GITHUB_USERNAME"
+#define GITHUB_REPO   "YOUR_PRIVATE_REPO_NAME"
+#define GITHUB_BRANCH "main"
+
+// ===== Machine Info =====
+#define MACHINE_SN    "000000"
+#define MACHINE_MODEL "Water Rower"
+
+// ===== ST7735S TFT Pins (SPI — ESP32-S3) =====
+#define TFT_CS        GPIO_NUM_10
+#define TFT_RST       GPIO_NUM_9
+#define TFT_DC        GPIO_NUM_8
+#define TFT_MOSI      GPIO_NUM_11   // SDA
+#define TFT_SCLK      GPIO_NUM_12   // SCL
+#define TFT_BL        GPIO_NUM_13   // Backlight
+
+#define TFT_WIDTH     128
+#define TFT_HEIGHT    160
+
+// ===== LDR Sensor (光敏电阻 — original WaterRower 3-wire) =====
+#define LDR_SIGNAL_PIN    GPIO_NUM_1   // ADC1 — signal wire (analog read)
+#define LDR_THRESHOLD     2000         // 0-4095, adjust after testing!
+#define LDR_HYSTERESIS    300          // prevent noise triggering
+
+// ===== 4 Built-in Buttons on TFT module =====
+#define BTN_UP_PIN    GPIO_NUM_5    // K1
+#define BTN_DOWN_PIN  GPIO_NUM_6    // K2
+#define BTN_HASH_PIN  GPIO_NUM_7    // K3 (#)
+#define BTN_STAR_PIN  GPIO_NUM_15   // K4 (*)
+
+// ===== Speaker (喇叭) =====
+#define SPEAKER_PIN   GPIO_NUM_16
+#define TONE_START    1000   // Hz
+#define TONE_STOP     500    // Hz
+#define TONE_BEEP     1500   // Hz
+#define TONE_UPLOAD   2000   // Hz
+#define TONE_DURATION 150    // ms
+
+// ===== Calibration =====
+#define PULSES_PER_REV      1
+#define METERS_PER_PULSE    0.00875f
+#define STROKE_GAP_MS       500
+#define CAL_PER_METER       0.04f
+#define IDLE_TIMEOUT_MS     3000
