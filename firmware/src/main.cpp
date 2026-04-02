@@ -5,13 +5,14 @@
  * Hardware:
  *   - ESP32-S3 DevKitC-1
  *   - ST7735S 1.8" 128x160 TFT with 4 built-in keys
- *   - LDR (光敏电阻) — original WaterRower sensor via 4-pin JST
+ *   - Sensor: LDR (光敏电阻) OR Hall effect (霍尔传感器)
+ *     Choose in config.h: SENSOR_TYPE_LDR or SENSOR_TYPE_HALL
  *   - Speaker (喇叭) — for sound feedback
  *   - Large half breadboard (165x55mm)
  *
- * Sensor: The WaterRower uses an optical sensor (LDR + IR LED).
- * When a flywheel paddle passes, it blocks light → LDR value drops.
- * We read the LDR with analogRead and detect pulse edges.
+ * Sensor options:
+ *   LDR:  Original WaterRower optical sensor (analog read)
+ *   Hall: A3144/OH3144 + magnet on flywheel (digital interrupt)
  *
  * Keys (on TFT module):
  *   * (K4)  = Start / Resume
@@ -29,6 +30,14 @@
 #include <ArduinoJson.h>
 #include <mbedtls/base64.h>
 #include "config.h"
+
+// Compile-time sensor check
+#if !defined(SENSOR_TYPE_LDR) && !defined(SENSOR_TYPE_HALL)
+  #error "Define SENSOR_TYPE_LDR or SENSOR_TYPE_HALL in config.h"
+#endif
+#if defined(SENSOR_TYPE_LDR) && defined(SENSOR_TYPE_HALL)
+  #error "Only define ONE sensor type in config.h"
+#endif
 
 // ───────── Colors ─────────
 #define COL_BG        ST77XX_BLACK
@@ -50,11 +59,20 @@ enum Screen { SCR_IDLE, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
-// ───────── LDR Sensor State ─────────
-bool     ldrPulseActive = false;   // currently in a "blocked" state
+// ───────── Sensor State ─────────
 uint32_t pulseCount     = 0;
 unsigned long lastPulseMs = 0;
 unsigned long lastPulseIntervalMs = 0;
+
+#ifdef SENSOR_TYPE_LDR
+bool     ldrPulseActive = false;
+#endif
+
+#ifdef SENSOR_TYPE_HALL
+volatile unsigned long hallLastPulseUs  = 0;
+volatile unsigned long hallPulseCount   = 0;
+volatile unsigned long hallPulseIntervalUs = 0;
+#endif
 
 // ───────── Workout state ─────────
 bool     workoutActive  = false;
@@ -133,8 +151,10 @@ void setBacklight(uint8_t val) {
     }
 }
 
-// ───────── LDR Sensor Reading ─────────
-void readLDR() {
+// ───────── Sensor Reading ─────────
+
+#ifdef SENSOR_TYPE_LDR
+void readSensor() {
     if (!workoutActive) return;
 
     int val = analogRead(LDR_SIGNAL_PIN);
@@ -143,7 +163,6 @@ void readLDR() {
     if (!ldrPulseActive && val < (LDR_THRESHOLD - LDR_HYSTERESIS)) {
         ldrPulseActive = true;
         unsigned long now = millis();
-
         if (lastPulseMs > 0) {
             lastPulseIntervalMs = now - lastPulseMs;
         }
@@ -155,6 +174,45 @@ void readLDR() {
         ldrPulseActive = false;
     }
 }
+
+int getSensorRaw() { return analogRead(LDR_SIGNAL_PIN); }
+const char* getSensorLabel() { return "LDR"; }
+int getSensorThreshold() { return LDR_THRESHOLD; }
+#endif
+
+#ifdef SENSOR_TYPE_HALL
+void IRAM_ATTR hallISR() {
+    unsigned long now = micros();
+    unsigned long interval = now - hallLastPulseUs;
+    if (interval > HALL_MIN_PULSE_US) {
+        hallPulseIntervalUs = interval;
+        hallLastPulseUs = now;
+        hallPulseCount++;
+    }
+}
+
+void readSensor() {
+    if (!workoutActive) return;
+
+    noInterrupts();
+    unsigned long pc = hallPulseCount;
+    unsigned long interval = hallPulseIntervalUs;
+    interrupts();
+
+    if (pc > pulseCount) {
+        unsigned long now = millis();
+        if (lastPulseMs > 0) {
+            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
+        }
+        lastPulseMs = now;
+        pulseCount = pc;
+    }
+}
+
+int getSensorRaw() { return digitalRead(HALL_SENSOR_PIN) == LOW ? 0 : 4095; }
+const char* getSensorLabel() { return "HALL"; }
+int getSensorThreshold() { return 0; }
+#endif
 
 // ───────── WiFi ─────────
 void connectWiFi() {
@@ -297,12 +355,12 @@ void drawIdleScreen() {
 
     drawDivider(55);
 
-    // Show current LDR value for debugging/calibration
-    int ldrVal = analogRead(LDR_SIGNAL_PIN);
+    // Show current sensor value for debugging/calibration
+    int sensorVal = getSensorRaw();
     tft.setCursor(4, 60);
     tft.setTextColor(COL_LABEL);
     tft.setTextSize(1);
-    tft.printf("LDR: %d (thr:%d)", ldrVal, LDR_THRESHOLD);
+    tft.printf("%s: %d", getSensorLabel(), sensorVal);
 
     tft.setCursor(4, 78);
     tft.setTextColor(COL_ACCENT);
@@ -503,7 +561,13 @@ void resetWorkout() {
     workoutElapsedMs = 0; lastPulseMs = 0;
     lastStrokeBoundary = 0; inStroke = false;
     pulseCount = 0; displayPage = 0;
-    ldrPulseActive = false; lastPulseIntervalMs = 0;
+    lastPulseIntervalMs = 0;
+#ifdef SENSOR_TYPE_LDR
+    ldrPulseActive = false;
+#endif
+#ifdef SENSOR_TYPE_HALL
+    hallPulseCount = 0;
+#endif
 }
 
 // ───────── Process sensor data ─────────
@@ -665,9 +729,17 @@ void setup() {
     tft.setTextColor(COL_LABEL);
     tft.println("LDR Sensor + Speaker");
 
-    // Pins
+    // Sensor pins
+#ifdef SENSOR_TYPE_LDR
     pinMode(LDR_SIGNAL_PIN, INPUT);
     analogSetAttenuation(ADC_11db);  // full 0-3.3V range
+#endif
+#ifdef SENSOR_TYPE_HALL
+    pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), hallISR, FALLING);
+#endif
+
+    // Button pins
     pinMode(BTN_UP_PIN,   INPUT_PULLUP);
     pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
     pinMode(BTN_HASH_PIN, INPUT_PULLUP);
@@ -693,8 +765,8 @@ void loop() {
     readAllButtons();
     handleInput();
 
-    // Read LDR sensor (fast polling, not interrupt-based for analog)
-    readLDR();
+    // Read sensor (LDR: fast polling / Hall: ISR updates globals)
+    readSensor();
 
     processSensor();
 

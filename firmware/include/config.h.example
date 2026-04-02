@@ -25,10 +25,28 @@
 #define TFT_WIDTH     128
 #define TFT_HEIGHT    160
 
-// ===== LDR Sensor (光敏电阻 — original WaterRower 3-wire) =====
-#define LDR_SIGNAL_PIN    GPIO_NUM_1   // ADC1 — signal wire (analog read)
+// ============================================================
+// ===== SENSOR TYPE — Uncomment ONE of the two options =====
+// ============================================================
+
+// Option A: LDR (光敏电阻 / Photoresistor)
+//   - Original WaterRower optical sensor, 3-wire (VCC, Signal, GND)
+//   - Analog read, no extra hardware needed
+#define SENSOR_TYPE_LDR
+
+// Option B: Hall Effect Sensor (霍尔传感器)
+//   - Needs a Hall sensor (A3144/OH3144/SS49E) + magnet on flywheel
+//   - Digital interrupt, very reliable
+// #define SENSOR_TYPE_HALL
+
+// ===== LDR Settings (only used if SENSOR_TYPE_LDR) =====
+#define LDR_SIGNAL_PIN    GPIO_NUM_1   // ADC1 — analog read
 #define LDR_THRESHOLD     2000         // 0-4095, adjust after testing!
 #define LDR_HYSTERESIS    300          // prevent noise triggering
+
+// ===== Hall Settings (only used if SENSOR_TYPE_HALL) =====
+#define HALL_SENSOR_PIN   GPIO_NUM_4   // digital interrupt pin
+#define HALL_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
 
 // ===== 4 Built-in Buttons on TFT module =====
 #define BTN_UP_PIN    GPIO_NUM_5    // K1

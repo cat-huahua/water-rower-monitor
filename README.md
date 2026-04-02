@@ -6,7 +6,9 @@ ESP32-S3 replacement console for WaterRower machines. The original monitor was d
 
 - Real-time display: time, distance, split/500m, stroke rate, calories
 - 1.8" color TFT screen (ST7735S 128x160) with 4 built-in keys
-- LDR sensor reads the original WaterRower optical sensor (no modifications needed)
+- Supports **two sensor types** — choose in config.h:
+  - **LDR**: Original WaterRower optical sensor (no modifications needed)
+  - **Hall**: A3144 hall effect sensor + magnet on flywheel
 - Speaker for audio feedback (start/stop/button sounds)
 - Automatic workout upload to a private GitHub repo as JSON
 - Workout history browsing (last 10 sessions)
@@ -20,7 +22,7 @@ ESP32-S3 replacement console for WaterRower machines. The original monitor was d
 |-----------|---------|
 | MCU | ESP32-S3 DevKitC-1 |
 | Display | ST7735S 1.8" 128x160 RGB TFT (with 4 keys) |
-| Sensor | Original WaterRower LDR (3-wire: VCC, Signal, GND) |
+| Sensor | LDR (original 3-wire) **or** Hall effect (A3144 + magnet) |
 | Audio | Small oval speaker (PWM driven) |
 | Power | 5V 3000mAh 18650 USB-C battery pack |
 | Board | Large half breadboard (165x55mm) |
@@ -44,6 +46,7 @@ See [APPLY.md](APPLY.md) for step-by-step assembly guide with photos.
 2. Edit `firmware/include/config.h` with your:
    - WiFi SSID and password
    - GitHub personal access token and repo info
+   - Sensor type: uncomment `SENSOR_TYPE_LDR` or `SENSOR_TYPE_HALL`
 
 3. Create a **private** GitHub repo for workout logs, with a `workouts/` folder
 
