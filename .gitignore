@@ -11,6 +11,9 @@ enclosure/*.off
 enclosure/*.amf
 enclosure/*.3mf
 
+# Generator script (not needed in repo)
+generate_wiring.py
+
 # OS
 .DS_Store
 Thumbs.db

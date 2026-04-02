@@ -30,7 +30,9 @@ ESP32-S3 replacement console for WaterRower machines. The original monitor was d
 
 ## Wiring
 
-See [WIRING.md](WIRING.md) for full wiring diagram and pin assignments.
+![Wiring Diagram](wiring_diagram.png)
+
+See [WIRING.md](WIRING.md) for detailed pin assignments.
 
 ## Assembly
 
