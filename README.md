@@ -2,6 +2,10 @@
 
 ESP32-S3 replacement console for WaterRower machines. The original monitor was destroyed by leaking batteries — this project replaces it with modern hardware and adds WiFi workout logging.
 
+## Overview
+
+![Assembled Overview](overview.png)
+
 ## Features
 
 - Real-time display: time, distance, split/500m, stroke rate, calories
