@@ -315,9 +315,9 @@ bool consume(Button &b) {
 
 // ───────── Speaker ─────────
 void playTone(uint16_t freq, uint16_t durationMs) {
-    ledcWriteTone(SPEAKER_PIN, freq);
+    ledcWriteTone(1, freq);
     delay(durationMs);
-    ledcWriteTone(SPEAKER_PIN, 0);
+    ledcWriteTone(1, 0);
 }
 
 void beep() {
@@ -327,7 +327,7 @@ void beep() {
 // ───────── Backlight ─────────
 void setBacklight(uint8_t val) {
     if (TFT_BL >= 0) {
-        ledcWrite(TFT_BL, val);
+        ledcWrite(0, val);
     }
 }
 
@@ -958,14 +958,16 @@ void refreshDisplay() {
 void setup() {
     Serial.begin(115200);
 
-    // Backlight
+    // Backlight (LEDC channel 0)
     if (TFT_BL >= 0) {
-        ledcAttach(TFT_BL, 5000, 8);
+        ledcSetup(0, 5000, 8);
+        ledcAttachPin(TFT_BL, 0);
         setBacklight(brightness);
     }
 
-    // Speaker
-    ledcAttach(SPEAKER_PIN, 2000, 8);
+    // Speaker (LEDC channel 1)
+    ledcSetup(1, 2000, 8);
+    ledcAttachPin(SPEAKER_PIN, 1);
 
     // TFT
     tft.initR(INITR_BLACKTAB);
