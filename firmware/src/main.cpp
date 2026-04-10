@@ -32,10 +32,10 @@
 #include "config.h"
 
 // Compile-time sensor check
-#if !defined(SENSOR_TYPE_LDR) && !defined(SENSOR_TYPE_HALL)
-  #error "Define SENSOR_TYPE_LDR or SENSOR_TYPE_HALL in config.h"
+#if !defined(SENSOR_TYPE_LDR) && !defined(SENSOR_TYPE_HALL) && !defined(SENSOR_TYPE_BLOCKER)
+  #error "Define SENSOR_TYPE_LDR, SENSOR_TYPE_HALL, or SENSOR_TYPE_BLOCKER in config.h"
 #endif
-#if defined(SENSOR_TYPE_LDR) && defined(SENSOR_TYPE_HALL)
+#if (defined(SENSOR_TYPE_LDR) + defined(SENSOR_TYPE_HALL) + defined(SENSOR_TYPE_BLOCKER)) > 1
   #error "Only define ONE sensor type in config.h"
 #endif
 
@@ -254,6 +254,12 @@ volatile unsigned long hallPulseCount   = 0;
 volatile unsigned long hallPulseIntervalUs = 0;
 #endif
 
+#ifdef SENSOR_TYPE_BLOCKER
+volatile unsigned long blockerLastPulseUs  = 0;
+volatile unsigned long blockerPulseCount   = 0;
+volatile unsigned long blockerPulseIntervalUs = 0;
+#endif
+
 // ───────── Workout state ─────────
 bool     workoutActive  = false;
 uint32_t totalPulses    = 0;
@@ -391,6 +397,40 @@ void readSensor() {
 
 int getSensorRaw() { return digitalRead(HALL_SENSOR_PIN) == LOW ? 0 : 4095; }
 const char* getSensorLabel() { return "HALL"; }
+int getSensorThreshold() { return 0; }
+#endif
+
+#ifdef SENSOR_TYPE_BLOCKER
+void IRAM_ATTR blockerISR() {
+    unsigned long now = micros();
+    unsigned long interval = now - blockerLastPulseUs;
+    if (interval > BLOCKER_MIN_PULSE_US) {
+        blockerPulseIntervalUs = interval;
+        blockerLastPulseUs = now;
+        blockerPulseCount++;
+    }
+}
+
+void readSensor() {
+    if (!workoutActive) return;
+
+    noInterrupts();
+    unsigned long pc = blockerPulseCount;
+    unsigned long interval = blockerPulseIntervalUs;
+    interrupts();
+
+    if (pc > pulseCount) {
+        unsigned long now = millis();
+        if (lastPulseMs > 0) {
+            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
+        }
+        lastPulseMs = now;
+        pulseCount = pc;
+    }
+}
+
+int getSensorRaw() { return digitalRead(BLOCKER_SENSOR_PIN) == LOW ? 0 : 4095; }
+const char* getSensorLabel() { return "BLKR"; }
 int getSensorThreshold() { return 0; }
 #endif
 
@@ -823,6 +863,9 @@ void resetWorkout() {
 #ifdef SENSOR_TYPE_HALL
     hallPulseCount = 0;
 #endif
+#ifdef SENSOR_TYPE_BLOCKER
+    blockerPulseCount = 0;
+#endif
 }
 
 // ───────── Process sensor data ─────────
@@ -1007,8 +1050,10 @@ void setup() {
     tft.setCursor(20, 80);
 #ifdef SENSOR_TYPE_LDR
     tft.print("Sensor: LDR");
-#else
+#elif defined(SENSOR_TYPE_HALL)
     tft.print("Sensor: Hall");
+#elif defined(SENSOR_TYPE_BLOCKER)
+    tft.print("Sensor: Blocker");
 #endif
 
     // Sensor pins
@@ -1019,6 +1064,11 @@ void setup() {
 #ifdef SENSOR_TYPE_HALL
     pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
     attachInterrupt(digitalPinToInterrupt(HALL_SENSOR_PIN), hallISR, FALLING);
+#endif
+#ifdef SENSOR_TYPE_BLOCKER
+    pinMode(BLOCKER_SENSOR_PIN, INPUT_PULLUP);
+    attachInterrupt(digitalPinToInterrupt(BLOCKER_SENSOR_PIN), blockerISR,
+                    BLOCKER_ACTIVE_LOW ? FALLING : RISING);
 #endif
 
     // Button pins

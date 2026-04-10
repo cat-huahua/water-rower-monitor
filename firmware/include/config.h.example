@@ -26,7 +26,7 @@
 #define TFT_HEIGHT    160
 
 // ============================================================
-// ===== SENSOR TYPE — Uncomment ONE of the two options =====
+// ===== SENSOR TYPE — Uncomment ONE of the three options =====
 // ============================================================
 
 // Option A: LDR (光敏电阻 / Photoresistor)
@@ -39,6 +39,12 @@
 //   - Digital interrupt, very reliable
 // #define SENSOR_TYPE_HALL
 
+// Option C: Optical Blocker / Slot Sensor (光遮断器/槽型光耦)
+//   - e.g. HY301, ITR9608, GP1A57HRJ00F
+//   - Flywheel paddle breaks IR beam → digital pulse
+//   - 3-wire (VCC, Signal, GND), digital interrupt
+// #define SENSOR_TYPE_BLOCKER
+
 // ===== LDR Settings (only used if SENSOR_TYPE_LDR) =====
 #define LDR_SIGNAL_PIN    GPIO_NUM_1   // ADC1 — analog read
 #define LDR_THRESHOLD     2000         // 0-4095, adjust after testing!
@@ -47,6 +53,11 @@
 // ===== Hall Settings (only used if SENSOR_TYPE_HALL) =====
 #define HALL_SENSOR_PIN   GPIO_NUM_4   // digital interrupt pin
 #define HALL_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
+
+// ===== Blocker Settings (only used if SENSOR_TYPE_BLOCKER) =====
+#define BLOCKER_SENSOR_PIN   GPIO_NUM_4   // digital interrupt pin (same as Hall)
+#define BLOCKER_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
+#define BLOCKER_ACTIVE_LOW   true         // true=signal LOW when blocked, false=HIGH
 
 // ===== 4 Built-in Buttons on TFT module =====
 #define BTN_UP_PIN    GPIO_NUM_5    // K1
