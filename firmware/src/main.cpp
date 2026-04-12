@@ -29,6 +29,10 @@
 #include <Adafruit_ST7735.h>
 #include <ArduinoJson.h>
 #include <mbedtls/base64.h>
+#include <BLEDevice.h>
+#include <BLEServer.h>
+#include <BLEUtils.h>
+#include <BLE2902.h>
 #include "config.h"
 
 // Compile-time sensor check
@@ -234,6 +238,26 @@ static const char* const done_msgs[] = {
 Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
 uint8_t brightness = 200;
 
+// ───────── BLE FTMS (Fitness Machine Service) ─────────
+// UUIDs per Bluetooth FTMS spec
+#define FTMS_SERVICE_UUID        "00001826-0000-1000-8000-00805f9b34fb"
+#define ROWER_DATA_UUID          "00002AD1-0000-1000-8000-00805f9b34fb"
+#define FTMS_FEATURE_UUID        "00002ACC-0000-1000-8000-00805f9b34fb"
+#define FTMS_STATUS_UUID         "00002ADA-0000-1000-8000-00805f9b34fb"
+
+BLEServer* bleServer = nullptr;
+BLECharacteristic* rowerDataChar = nullptr;
+BLECharacteristic* ftmsFeatureChar = nullptr;
+bool bleClientConnected = false;
+unsigned long lastBleUpdate = 0;
+#define BLE_UPDATE_INTERVAL_MS 500
+
+class FTMSCallbacks : public BLEServerCallbacks {
+    void onConnect(BLEServer* s)    { bleClientConnected = true;  }
+    void onDisconnect(BLEServer* s) { bleClientConnected = false;
+        BLEDevice::startAdvertising(); }
+};
+
 // ───────── State machine ─────────
 enum Screen { SCR_IDLE, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY };
 Screen currentScreen = SCR_IDLE;
@@ -434,6 +458,100 @@ const char* getSensorLabel() { return "BLKR"; }
 int getSensorThreshold() { return 0; }
 #endif
 
+// ───────── BLE FTMS Setup & Update ─────────
+void initBLE() {
+    BLEDevice::init("WaterRower-" MACHINE_SN);
+    bleServer = BLEDevice::createServer();
+    bleServer->setCallbacks(new FTMSCallbacks());
+
+    // FTMS Service
+    BLEService* ftmsService = bleServer->createService(FTMS_SERVICE_UUID);
+
+    // FTMS Feature (required) — declare rower support
+    ftmsFeatureChar = ftmsService->createCharacteristic(
+        FTMS_FEATURE_UUID, BLECharacteristic::PROPERTY_READ);
+    // Fitness Machine Features: Rower supported
+    // Byte 0-3: Machine Features, Byte 4-7: Target Setting Features
+    uint8_t ftmsFeatures[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    ftmsFeatures[0] = 0x26; // stroke rate, total distance, pace, calories
+    ftmsFeatureChar->setValue(ftmsFeatures, 8);
+
+    // Rower Data (notify)
+    rowerDataChar = ftmsService->createCharacteristic(
+        ROWER_DATA_UUID,
+        BLECharacteristic::PROPERTY_NOTIFY);
+    rowerDataChar->addDescriptor(new BLE2902());
+
+    ftmsService->start();
+
+    // Advertise
+    BLEAdvertising* adv = BLEDevice::getAdvertising();
+    adv->addServiceUUID(FTMS_SERVICE_UUID);
+    adv->setScanResponse(true);
+    BLEDevice::startAdvertising();
+}
+
+void updateBLE() {
+    if (!bleClientConnected) return;
+    if (!workoutActive) return;
+    if (millis() - lastBleUpdate < BLE_UPDATE_INTERVAL_MS) return;
+    lastBleUpdate = millis();
+
+    // FTMS Rower Data format (per Bluetooth spec)
+    // Flags (2 bytes) + fields
+    unsigned long elapsed = workoutElapsedMs + (millis() - workoutStartMs);
+    uint16_t strokeRateX2 = (uint16_t)(strokeRate * 2);  // 0.5 resolution
+    uint16_t totalDist = (uint16_t)totalMeters;           // meters (wraps at 65535)
+    uint16_t paceS500 = 0;
+    if (currentSpeed > 0.1f) {
+        paceS500 = (uint16_t)(500.0f / currentSpeed);    // seconds per 500m
+    }
+    uint16_t totalCal = (uint16_t)totalCalories;
+    uint16_t elapsedSec = (uint16_t)(elapsed / 1000);
+
+    // Flags: bits indicate which fields are present
+    // Bit 1: stroke rate + stroke count
+    // Bit 2: total distance
+    // Bit 4: pace
+    // Bit 9: total energy
+    // Bit 11: elapsed time
+    uint16_t flags = 0;
+    flags |= (1 << 1);  // stroke rate present
+    flags |= (1 << 2);  // total distance present
+    flags |= (1 << 4);  // instantaneous pace present
+    flags |= (1 << 9);  // energy present
+    flags |= (1 << 11); // elapsed time present
+
+    uint8_t data[20];
+    int idx = 0;
+    data[idx++] = flags & 0xFF;
+    data[idx++] = (flags >> 8) & 0xFF;
+    // Stroke rate (uint16, 0.5 resolution)
+    data[idx++] = strokeRateX2 & 0xFF;
+    data[idx++] = (strokeRateX2 >> 8) & 0xFF;
+    // Stroke count (uint16)
+    data[idx++] = strokeCount & 0xFF;
+    data[idx++] = (strokeCount >> 8) & 0xFF;
+    // Total distance (uint24, little endian)
+    data[idx++] = totalDist & 0xFF;
+    data[idx++] = (totalDist >> 8) & 0xFF;
+    data[idx++] = 0; // high byte
+    // Instantaneous pace (uint16, seconds per 500m)
+    data[idx++] = paceS500 & 0xFF;
+    data[idx++] = (paceS500 >> 8) & 0xFF;
+    // Energy: total (uint16) + per hour (uint16) + per min (uint8)
+    data[idx++] = totalCal & 0xFF;
+    data[idx++] = (totalCal >> 8) & 0xFF;
+    data[idx++] = 0; data[idx++] = 0; // cal/hour (not calculated)
+    data[idx++] = 0;                   // cal/min
+    // Elapsed time (uint16, seconds)
+    data[idx++] = elapsedSec & 0xFF;
+    data[idx++] = (elapsedSec >> 8) & 0xFF;
+
+    rowerDataChar->setValue(data, idx);
+    rowerDataChar->notify();
+}
+
 // ───────── WiFi ─────────
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
@@ -529,7 +647,12 @@ void drawHeader(const char* title) {
     tft.setTextColor(COL_ACCENT);
     tft.setCursor(4, 5);
     tft.print(title);
-    tft.setCursor(TFT_WIDTH - 18, 5);
+    // BLE indicator
+    tft.setCursor(TFT_WIDTH - 36, 5);
+    tft.setTextColor(bleClientConnected ? COL_VALUE : COL_LABEL);
+    tft.print(bleClientConnected ? "BT" : "bt");
+    // WiFi indicator
+    tft.setCursor(TFT_WIDTH - 16, 5);
     tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR);
     tft.print(WiFi.status() == WL_CONNECTED ? "W+" : "W-");
 }
@@ -1077,6 +1200,9 @@ void setup() {
     pinMode(BTN_HASH_PIN, INPUT_PULLUP);
     pinMode(BTN_STAR_PIN, INPUT_PULLUP);
 
+    // BLE FTMS
+    initBLE();
+
     // WiFi + NTP
     connectWiFi();
     configTime(0, 0, "pool.ntp.org", "time.nist.gov");
@@ -1101,6 +1227,9 @@ void loop() {
     readSensor();
 
     processSensor();
+
+    // BLE broadcast
+    updateBLE();
 
     // Upload (blocking)
     if (currentScreen == SCR_UPLOADING) {
