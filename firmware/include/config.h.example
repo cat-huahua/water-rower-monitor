@@ -55,8 +55,11 @@
 #define HALL_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
 
 // ===== Blocker Settings (only used if SENSOR_TYPE_BLOCKER) =====
-#define BLOCKER_SENSOR_PIN   GPIO_NUM_4   // digital interrupt pin (same as Hall)
-#define BLOCKER_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
+// HW-487 / LM393 style optical interrupter (WaterRower original sensor)
+// IMPORTANT: Needs 5V supply! Connect VCC to 5Vin, NOT 3.3V
+// Typical wiring: Red=5V(VIN), Green=GND, Blue=SIG
+#define BLOCKER_SENSOR_PIN   GPIO_NUM_5   // digital interrupt pin
+#define BLOCKER_MIN_PULSE_US 1500         // minimum pulse interval (noise filter)
 #define BLOCKER_ACTIVE_LOW   true         // true=signal LOW when blocked, false=HIGH
 
 // ===== 4 Built-in Buttons on TFT module =====
