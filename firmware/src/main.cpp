@@ -261,6 +261,8 @@ class FTMSCallbacks : public BLEServerCallbacks {
 // ───────── Users ─────────
 static const char* const userNames[] = USER_NAMES;
 int currentUser = 0;
+int userScrollOffset = 0;
+#define USER_VISIBLE 5   // rows that fit on screen
 
 // ───────── State machine ─────────
 enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY };
@@ -976,17 +978,20 @@ void drawUserSelectScreen() {
     tft.fillScreen(COL_BG);
     drawHeader("WHO ARE YOU?");
 
-    tft.drawBitmap(56, 22, bmp_rower, 16, 16, COL_ACCENT);
+    // scroll up indicator
+    if (userScrollOffset > 0) {
+        tft.setTextColor(COL_LABEL);
+        tft.setTextSize(1);
+        tft.setCursor(60, 20);
+        tft.print("\x1e");  // ▲
+    }
 
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 44);
-    tft.print("Select your profile:");
-
-    for (int i = 0; i < USER_COUNT; i++) {
-        int y = 58 + i * 16;
+    int visibleEnd = min(userScrollOffset + USER_VISIBLE, USER_COUNT);
+    for (int i = userScrollOffset; i < visibleEnd; i++) {
+        int row = i - userScrollOffset;
+        int y = 28 + row * 18;
         if (i == currentUser) {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 14, COL_HEADER_BG);
+            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
             tft.setTextColor(COL_ACCENT);
             tft.setCursor(6, y);
             tft.print("> ");
@@ -997,6 +1002,19 @@ void drawUserSelectScreen() {
         }
         tft.setTextSize(1);
         tft.print(userNames[i]);
+
+        // counter on right
+        tft.setTextColor(COL_DIVIDER);
+        tft.setCursor(TFT_WIDTH - 20, y);
+        tft.printf("%d/%d", i + 1, USER_COUNT);
+    }
+
+    // scroll down indicator
+    if (userScrollOffset + USER_VISIBLE < USER_COUNT) {
+        tft.setTextColor(COL_LABEL);
+        tft.setTextSize(1);
+        tft.setCursor(60, 140);
+        tft.print("\x1f");  // ▼
     }
 
     drawKeyHints("UP", "DN", "BACK", "GO");
@@ -1083,6 +1101,7 @@ void handleInput() {
         if (consume(btnStar)) {
             beep();
             currentUser = 0;
+            userScrollOffset = 0;
             currentScreen = SCR_USER_SELECT;
         }
         if (consume(btnHash)) {
@@ -1101,8 +1120,20 @@ void handleInput() {
         break;
 
     case SCR_USER_SELECT:
-        if (consume(btnUp))   { if (currentUser > 0) currentUser--; }
-        if (consume(btnDown)) { if (currentUser < USER_COUNT - 1) currentUser++; }
+        if (consume(btnUp)) {
+            if (currentUser > 0) {
+                currentUser--;
+                if (currentUser < userScrollOffset)
+                    userScrollOffset = currentUser;
+            }
+        }
+        if (consume(btnDown)) {
+            if (currentUser < USER_COUNT - 1) {
+                currentUser++;
+                if (currentUser >= userScrollOffset + USER_VISIBLE)
+                    userScrollOffset = currentUser - USER_VISIBLE + 1;
+            }
+        }
         if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
         if (consume(btnStar)) {
             beep();
