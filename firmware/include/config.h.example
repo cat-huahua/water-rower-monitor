@@ -14,6 +14,10 @@
 #define MACHINE_SN    "000000"
 #define MACHINE_MODEL "Water Rower"
 
+// ===== Users (up to 8 names, shown on user-select screen before each workout) =====
+#define USER_COUNT 2
+#define USER_NAMES {"User1", "User2"}
+
 // ===== ST7735S TFT Pins (SPI — ESP32-S3) =====
 #define TFT_CS        GPIO_NUM_10
 #define TFT_RST       GPIO_NUM_9

@@ -258,8 +258,12 @@ class FTMSCallbacks : public BLEServerCallbacks {
         BLEDevice::startAdvertising(); }
 };
 
+// ───────── Users ─────────
+static const char* const userNames[] = USER_NAMES;
+int currentUser = 0;
+
 // ───────── State machine ─────────
-enum Screen { SCR_IDLE, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY };
+enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -610,10 +614,19 @@ bool uploadToGitHub(uint32_t durSec) {
         (const unsigned char*)content.c_str(), content.length());
     encoded[encodedLen] = '\0';
 
-    String ts = getTimestamp();
-    ts.replace("-", ""); ts.replace(":", "");
-    ts.replace("T", "_"); ts.replace("Z", "");
-    String filename = "workouts/workout_" + ts + ".json";
+    struct tm _ti;
+    String filename;
+    if (getLocalTime(&_ti, 100)) {
+        char _pb[48];
+        snprintf(_pb, sizeof(_pb), "%02d/%02d/%02d/%s_%02d%02d%02d.json",
+            _ti.tm_mday, _ti.tm_mon + 1, _ti.tm_year % 100,
+            userNames[currentUser], _ti.tm_hour, _ti.tm_min, _ti.tm_sec);
+        filename = String(_pb);
+    } else {
+        String ts = getTimestamp();
+        ts.replace("-",""); ts.replace(":",""); ts.replace("T","_"); ts.replace("Z","");
+        filename = String(MACHINE_SN) + "/" + ts + ".json";
+    }
 
     String url = "https://api.github.com/repos/";
     url += GITHUB_OWNER; url += "/";
@@ -959,6 +972,36 @@ void drawUploadingScreen() {
     }
 }
 
+void drawUserSelectScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("WHO ARE YOU?");
+
+    tft.drawBitmap(56, 22, bmp_rower, 16, 16, COL_ACCENT);
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 44);
+    tft.print("Select your profile:");
+
+    for (int i = 0; i < USER_COUNT; i++) {
+        int y = 58 + i * 16;
+        if (i == currentUser) {
+            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 14, COL_HEADER_BG);
+            tft.setTextColor(COL_ACCENT);
+            tft.setCursor(6, y);
+            tft.print("> ");
+        } else {
+            tft.setTextColor(COL_LABEL);
+            tft.setCursor(6, y);
+            tft.print("  ");
+        }
+        tft.setTextSize(1);
+        tft.print(userNames[i]);
+    }
+
+    drawKeyHints("UP", "DN", "BACK", "GO");
+}
+
 // ───────── Save to history ─────────
 void saveToHistory(uint32_t durSec) {
     if (historyCount < MAX_HISTORY) historyCount++;
@@ -1039,11 +1082,8 @@ void handleInput() {
     case SCR_IDLE:
         if (consume(btnStar)) {
             beep();
-            resetWorkout();
-            workoutActive = true;
-            workoutStartMs = millis();
-            currentScreen = SCR_WORKOUT;
-            playTone(TONE_START, TONE_DURATION);
+            currentUser = 0;
+            currentScreen = SCR_USER_SELECT;
         }
         if (consume(btnHash)) {
             beep();
@@ -1057,6 +1097,20 @@ void handleInput() {
         if (consume(btnDown)) {
             brightness = max((uint8_t)10, (uint8_t)(brightness - 25));
             setBacklight(brightness);
+        }
+        break;
+
+    case SCR_USER_SELECT:
+        if (consume(btnUp))   { if (currentUser > 0) currentUser--; }
+        if (consume(btnDown)) { if (currentUser < USER_COUNT - 1) currentUser++; }
+        if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
+        if (consume(btnStar)) {
+            beep();
+            resetWorkout();
+            workoutActive = true;
+            workoutStartMs = millis();
+            currentScreen = SCR_WORKOUT;
+            playTone(TONE_START, TONE_DURATION);
         }
         break;
 
@@ -1112,10 +1166,11 @@ void refreshDisplay() {
     lastDrawnScreen = currentScreen;
 
     switch (currentScreen) {
-        case SCR_IDLE:    drawIdleScreen(); break;
-        case SCR_WORKOUT: drawWorkoutScreen(); break;
-        case SCR_PAUSED:  drawPausedScreen(); break;
-        case SCR_HISTORY: drawHistoryScreen(); break;
+        case SCR_IDLE:        drawIdleScreen(); break;
+        case SCR_USER_SELECT: drawUserSelectScreen(); break;
+        case SCR_WORKOUT:     drawWorkoutScreen(); break;
+        case SCR_PAUSED:      drawPausedScreen(); break;
+        case SCR_HISTORY:     drawHistoryScreen(); break;
         default: break;
     }
 }
