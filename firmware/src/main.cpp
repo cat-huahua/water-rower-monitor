@@ -892,7 +892,12 @@ void drawSummaryScreen(bool uploadOk) {
 
     // Upload status with emoji
     tft.setCursor(4, 126);
-    if (uploadOk) {
+    if (currentUser == USER_COUNT) {
+        tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_WARN);
+        tft.setTextColor(COL_WARN);
+        tft.setCursor(24, 128);
+        tft.print("Guest - BT only");
+    } else if (uploadOk) {
         tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_VALUE);
         tft.setTextColor(COL_VALUE);
         tft.setCursor(24, 128);
@@ -1326,14 +1331,20 @@ void loop() {
 
     // Upload (blocking)
     if (currentScreen == SCR_UPLOADING) {
-        drawUploadingScreen();
         uint32_t durSec = workoutElapsedMs / 1000;
         saveToHistory(durSec);
-        bool ok = uploadToGitHub(durSec);
-        if (ok) {
-            playTone(TONE_UPLOAD, 200);
+        bool ok = false;
+        if (currentUser == USER_COUNT) {
+            // Guest: screen + BLE only, no GitHub
+            beep();
         } else {
-            playTone(300, 500);
+            drawUploadingScreen();
+            ok = uploadToGitHub(durSec);
+            if (ok) {
+                playTone(TONE_UPLOAD, 200);
+            } else {
+                playTone(300, 500);
+            }
         }
         drawSummaryScreen(ok);
         currentScreen = SCR_SUMMARY;
