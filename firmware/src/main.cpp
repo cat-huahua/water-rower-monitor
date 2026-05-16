@@ -622,7 +622,8 @@ bool uploadToGitHub(uint32_t durSec) {
         char _pb[48];
         snprintf(_pb, sizeof(_pb), "%02d/%02d/%02d/%s_%02d%02d%02d.json",
             _ti.tm_mday, _ti.tm_mon + 1, _ti.tm_year % 100,
-            userNames[currentUser], _ti.tm_hour, _ti.tm_min, _ti.tm_sec);
+            (currentUser < USER_COUNT ? userNames[currentUser] : "Guest"),
+            _ti.tm_hour, _ti.tm_min, _ti.tm_sec);
         filename = String(_pb);
     } else {
         String ts = getTimestamp();
@@ -986,31 +987,37 @@ void drawUserSelectScreen() {
         tft.print("\x1e");  // ▲
     }
 
-    int visibleEnd = min(userScrollOffset + USER_VISIBLE, USER_COUNT);
+    int totalUsers = USER_COUNT + 1;  // +1 for Guest
+    int visibleEnd = min(userScrollOffset + USER_VISIBLE, totalUsers);
     for (int i = userScrollOffset; i < visibleEnd; i++) {
         int row = i - userScrollOffset;
         int y = 28 + row * 18;
+        bool isGuest = (i == USER_COUNT);
+        const char* name = isGuest ? "Guest" : userNames[i];
+
         if (i == currentUser) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT);
+            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT);
             tft.setCursor(6, y);
             tft.print("> ");
         } else {
-            tft.setTextColor(COL_LABEL);
+            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL);
             tft.setCursor(6, y);
             tft.print("  ");
         }
         tft.setTextSize(1);
-        tft.print(userNames[i]);
+        tft.print(name);
 
-        // counter on right
-        tft.setTextColor(COL_DIVIDER);
-        tft.setCursor(TFT_WIDTH - 20, y);
-        tft.printf("%d/%d", i + 1, USER_COUNT);
+        // counter on right (Guest shows no number)
+        if (!isGuest) {
+            tft.setTextColor(COL_DIVIDER);
+            tft.setCursor(TFT_WIDTH - 20, y);
+            tft.printf("%d/%d", i + 1, USER_COUNT);
+        }
     }
 
     // scroll down indicator
-    if (userScrollOffset + USER_VISIBLE < USER_COUNT) {
+    if (userScrollOffset + USER_VISIBLE < USER_COUNT + 1) {
         tft.setTextColor(COL_LABEL);
         tft.setTextSize(1);
         tft.setCursor(60, 140);
@@ -1128,7 +1135,7 @@ void handleInput() {
             }
         }
         if (consume(btnDown)) {
-            if (currentUser < USER_COUNT - 1) {
+            if (currentUser < USER_COUNT) {  // USER_COUNT = Guest index
                 currentUser++;
                 if (currentUser >= userScrollOffset + USER_VISIBLE)
                     userScrollOffset = currentUser - USER_VISIBLE + 1;
