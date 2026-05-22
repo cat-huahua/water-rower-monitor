@@ -83,8 +83,8 @@
 #define TONE_DURATION 150    // ms
 
 // ===== Calibration =====
-#define PULSES_PER_REV      1
-#define METERS_PER_PULSE    0.00875f
+#define PULSES_PER_REV      61                  // 60 teeth, visual count — calibrate with sensor!
+#define METERS_PER_PULSE    (0.00875f / 61)     // ~0.0001434m per pulse
 #define STROKE_GAP_MS       500
 #define CAL_PER_METER       0.04f
 #define IDLE_TIMEOUT_MS     3000
