@@ -22,6 +22,7 @@
  */
 
 #include <Arduino.h>
+#include <Preferences.h>
 #include <SPI.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
@@ -264,8 +265,46 @@ int currentUser = 0;
 int userScrollOffset = 0;
 #define USER_VISIBLE 5   // rows that fit on screen
 
+// ───────── NVS / Calibration ─────────
+Preferences prefs;
+float calMetersPerPulse = METERS_PER_PULSE;
+
+void loadCalibration() {
+    prefs.begin("wrower", true);
+    calMetersPerPulse = prefs.getFloat("mpp", METERS_PER_PULSE);
+    prefs.end();
+}
+void saveCalibration() {
+    prefs.begin("wrower", false);
+    prefs.putFloat("mpp", calMetersPerPulse);
+    prefs.end();
+}
+
+// ───────── Combo / Password detector ─────────
+static const uint8_t calibCombo[]    = CALIB_COMBO;
+static const uint8_t calibPassword[] = CALIB_PASSWORD;
+
+uint8_t comboBuffer[CALIB_COMBO_LEN] = {};
+uint8_t comboPos = 0;
+uint8_t pwdBuffer[CALIB_PASSWORD_LEN] = {};
+uint8_t pwdPos   = 0;
+bool    pwdWrong = false;
+
+void pushCombo(uint8_t btn) {
+    // Shift buffer
+    for (int i = 0; i < CALIB_COMBO_LEN - 1; i++) comboBuffer[i] = comboBuffer[i+1];
+    comboBuffer[CALIB_COMBO_LEN - 1] = btn;
+    comboPos++;
+}
+bool checkCombo() {
+    if (comboPos < CALIB_COMBO_LEN) return false;
+    for (int i = 0; i < CALIB_COMBO_LEN; i++)
+        if (comboBuffer[i] != calibCombo[i]) return false;
+    return true;
+}
+
 // ───────── State machine ─────────
-enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY };
+enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY, SCR_CALIB_AUTH, SCR_CALIB };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -1006,6 +1045,79 @@ void drawUploadingScreen() {
     }
 }
 
+void drawCalibAuthScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("ADMIN ACCESS");
+
+    tft.drawBitmap(56, 22, bmp_skull, 16, 16, COL_WARN);
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 44);
+    tft.print("Enter password:");
+
+    // Show entered dots
+    for (int i = 0; i < CALIB_PASSWORD_LEN; i++) {
+        tft.setTextSize(2);
+        tft.setTextColor(i < (int)pwdPos ? COL_ACCENT : COL_DIVIDER);
+        tft.setCursor(16 + i * 26, 58);
+        tft.print(i < (int)pwdPos ? "*" : "-");
+    }
+
+    if (pwdWrong) {
+        tft.setTextSize(1);
+        tft.setTextColor(COL_ERROR);
+        tft.setCursor(4, 90);
+        tft.print("WRONG PASSWORD!");
+    }
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 108);
+    tft.print("\x18=0  \x19=1  #=2  *=3");
+
+    drawKeyHints("0", "1", "2", "3");
+}
+
+void drawCalibScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("CALIBRATION");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 22);
+    tft.print("METERS / PULSE");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_VALUE);
+    tft.setCursor(4, 36);
+    tft.printf("%.8f", calMetersPerPulse);
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 54);
+    tft.printf("= %.4f m/rev", calMetersPerPulse * PULSES_PER_REV);
+
+    drawDivider(68);
+
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 74);
+    tft.print("\x18 +0.000001");
+    tft.setCursor(4, 88);
+    tft.print("\x19 -0.000001");
+    tft.setCursor(4, 102);
+    tft.print("* SAVE & EXIT");
+    tft.setCursor(4, 116);
+    tft.print("# CANCEL");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_WARN);
+    tft.setCursor(4, 132);
+    tft.printf("Default: %.7f", (float)METERS_PER_PULSE);
+
+    drawKeyHints("+", "-", "BACK", "SAVE");
+}
+
 void drawUserSelectScreen() {
     tft.fillScreen(COL_BG);
     drawHeader("WHO ARE YOU?");
@@ -1097,12 +1209,12 @@ void processSensor() {
     if (pulseCount > totalPulses) {
         uint32_t newPulses = pulseCount - totalPulses;
         totalPulses = pulseCount;
-        totalMeters += newPulses * METERS_PER_PULSE;
+        totalMeters += newPulses * calMetersPerPulse;
         totalCalories = totalMeters * CAL_PER_METER;
 
         // Speed from last pulse interval
         if (lastPulseIntervalMs > 0) {
-            currentSpeed = METERS_PER_PULSE / (lastPulseIntervalMs / 1000.0f);
+            currentSpeed = calMetersPerPulse / (lastPulseIntervalMs / 1000.0f);
         }
 
         // Stroke detection
@@ -1136,24 +1248,67 @@ void processSensor() {
 void handleInput() {
     switch (currentScreen) {
     case SCR_IDLE:
+        if (consume(btnUp))   { pushCombo(0); brightness = min(255, brightness + 25); setBacklight(brightness); }
+        if (consume(btnDown)) { pushCombo(1); brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); }
+        if (consume(btnHash)) { pushCombo(2); beep(); displayPage = 0; currentScreen = SCR_HISTORY; }
         if (consume(btnStar)) {
-            beep();
-            currentUser = 0;
-            userScrollOffset = 0;
-            currentScreen = SCR_USER_SELECT;
+            pushCombo(3);
+            if (checkCombo()) {
+                // Secret combo entered → go to admin auth
+                memset(comboBuffer, 0, sizeof(comboBuffer));
+                comboPos = 0;
+                pwdPos = 0; pwdWrong = false;
+                beep(); delay(80); beep();
+                currentScreen = SCR_CALIB_AUTH;
+            } else {
+                beep();
+                currentUser = 0;
+                userScrollOffset = 0;
+                currentScreen = SCR_USER_SELECT;
+            }
+        }
+        break;
+
+    case SCR_CALIB_AUTH:
+        { // password entry — each button appends a digit
+            uint8_t pressed = 0xFF;
+            if (consume(btnUp))   pressed = 0;
+            if (consume(btnDown)) pressed = 1;
+            if (consume(btnHash)) pressed = 2;
+            if (consume(btnStar)) pressed = 3;
+            if (pressed != 0xFF) {
+                beep();
+                pwdWrong = false;
+                pwdBuffer[pwdPos++] = pressed;
+                if (pwdPos >= CALIB_PASSWORD_LEN) {
+                    bool ok = true;
+                    for (int i = 0; i < CALIB_PASSWORD_LEN; i++)
+                        if (pwdBuffer[i] != calibPassword[i]) { ok = false; break; }
+                    if (ok) {
+                        playTone(1600, 100);
+                        currentScreen = SCR_CALIB;
+                    } else {
+                        pwdWrong = true;
+                        pwdPos = 0;
+                        playTone(200, 300);
+                    }
+                }
+            }
+        }
+        break;
+
+    case SCR_CALIB:
+        if (consume(btnUp))   { calMetersPerPulse += 0.000001f; }
+        if (consume(btnDown)) { if (calMetersPerPulse > 0.000001f) calMetersPerPulse -= 0.000001f; }
+        if (consume(btnStar)) {
+            saveCalibration();
+            playTone(TONE_UPLOAD, 200);
+            currentScreen = SCR_IDLE;
         }
         if (consume(btnHash)) {
+            loadCalibration();  // revert unsaved changes
             beep();
-            displayPage = 0;
-            currentScreen = SCR_HISTORY;
-        }
-        if (consume(btnUp)) {
-            brightness = min(255, brightness + 25);
-            setBacklight(brightness);
-        }
-        if (consume(btnDown)) {
-            brightness = max((uint8_t)10, (uint8_t)(brightness - 25));
-            setBacklight(brightness);
+            currentScreen = SCR_IDLE;
         }
         break;
 
@@ -1240,6 +1395,8 @@ void refreshDisplay() {
         case SCR_WORKOUT:     drawWorkoutScreen(); break;
         case SCR_PAUSED:      drawPausedScreen(); break;
         case SCR_HISTORY:     drawHistoryScreen(); break;
+        case SCR_CALIB_AUTH:  drawCalibAuthScreen(); break;
+        case SCR_CALIB:       drawCalibScreen(); break;
         default: break;
     }
 }
@@ -1323,6 +1480,9 @@ void setup() {
     pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
     pinMode(BTN_HASH_PIN, INPUT_PULLUP);
     pinMode(BTN_STAR_PIN, INPUT_PULLUP);
+
+    // Load saved calibration from NVS
+    loadCalibration();
 
     // BLE FTMS
     initBLE();
