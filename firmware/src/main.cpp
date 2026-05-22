@@ -558,10 +558,36 @@ void updateBLE() {
     rowerDataChar->notify();
 }
 
-// ───────── WiFi ─────────
+// ───────── WiFi (multi-network, auto-switch) ─────────
+static const char* wifiSSIDs[]     = WIFI_SSIDS;
+static const char* wifiPasswords[] = WIFI_PASSWORDS;
+
 void connectWiFi() {
     if (WiFi.status() == WL_CONNECTED) return;
-    WiFi.begin(WIFI_SSID, WIFI_PASSWORD);
+
+    WiFi.disconnect(true);
+    WiFi.mode(WIFI_STA);
+
+    // Scan and find known networks sorted by RSSI
+    int found = WiFi.scanNetworks(false, true);
+    int bestIdx = -1;
+    int bestRSSI = -999;
+
+    for (int s = 0; s < found; s++) {
+        for (int k = 0; k < WIFI_COUNT; k++) {
+            if (WiFi.SSID(s) == wifiSSIDs[k]) {
+                if (WiFi.RSSI(s) > bestRSSI) {
+                    bestRSSI = WiFi.RSSI(s);
+                    bestIdx  = k;
+                }
+            }
+        }
+    }
+    WiFi.scanDelete();
+
+    if (bestIdx < 0) return;  // none found
+
+    WiFi.begin(wifiSSIDs[bestIdx], wifiPasswords[bestIdx]);
     int tries = 0;
     while (WiFi.status() != WL_CONNECTED && tries < 40) {
         delay(500);

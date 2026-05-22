@@ -1,8 +1,10 @@
 #pragma once
 
-// ===== WiFi =====
-#define WIFI_SSID     "YOUR_WIFI_SSID"
-#define WIFI_PASSWORD "YOUR_WIFI_PASSWORD"
+// ===== WiFi (multi-network, auto-switch) =====
+// Add up to 8 networks — device scans and connects to strongest available one
+#define WIFI_COUNT 2
+#define WIFI_SSIDS     {"HomeWiFi", "MobileHotspot"}
+#define WIFI_PASSWORDS {"homepass", "hotspotpass"}
 
 // ===== GitHub =====
 #define GITHUB_TOKEN  "ghp_YOUR_PERSONAL_ACCESS_TOKEN"
