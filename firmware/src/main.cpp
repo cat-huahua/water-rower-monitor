@@ -268,15 +268,28 @@ int userScrollOffset = 0;
 // ───────── NVS / Calibration ─────────
 Preferences prefs;
 float calMetersPerPulse = METERS_PER_PULSE;
+float userWeights[USER_COUNT + 1];   // +1 for Guest (index USER_COUNT)
 
 void loadCalibration() {
     prefs.begin("wrower", true);
     calMetersPerPulse = prefs.getFloat("mpp", METERS_PER_PULSE);
+    for (int i = 0; i <= USER_COUNT; i++) {
+        char key[6]; snprintf(key, sizeof(key), "w%d", i);
+        userWeights[i] = prefs.getFloat(key, 70.0f);
+    }
     prefs.end();
 }
 void saveCalibration() {
     prefs.begin("wrower", false);
     prefs.putFloat("mpp", calMetersPerPulse);
+    prefs.end();
+}
+void saveWeights() {
+    prefs.begin("wrower", false);
+    for (int i = 0; i <= USER_COUNT; i++) {
+        char key[6]; snprintf(key, sizeof(key), "w%d", i);
+        prefs.putFloat(key, userWeights[i]);
+    }
     prefs.end();
 }
 
@@ -303,8 +316,16 @@ bool checkCombo() {
     return true;
 }
 
+// ───────── Admin state ─────────
+int adminMenuItem  = 0;   // selected menu item
+int adminEditUser  = 0;   // user being edited in weight screen
+#define ADMIN_MENU_COUNT 2
+
 // ───────── State machine ─────────
-enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY, SCR_CALIB_AUTH, SCR_CALIB };
+enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
+              SCR_UPLOADING, SCR_HISTORY,
+              SCR_CALIB_AUTH, SCR_ADMIN_MENU, SCR_CALIB,
+              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -1045,6 +1066,91 @@ void drawUploadingScreen() {
     }
 }
 
+void drawAdminMenuScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("ADMIN MENU");
+
+    tft.drawBitmap(56, 20, bmp_trophy, 16, 16, COL_WARN);
+
+    const char* items[] = {"Calibration", "User Weights"};
+    for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
+        int y = 44 + i * 22;
+        if (i == adminMenuItem) {
+            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
+            tft.setTextColor(COL_ACCENT);
+            tft.setCursor(6, y); tft.print("> ");
+        } else {
+            tft.setTextColor(COL_LABEL);
+            tft.setCursor(6, y); tft.print("  ");
+        }
+        tft.setTextSize(1);
+        tft.print(items[i]);
+    }
+    drawKeyHints("UP", "DN", "EXIT", "OK");
+}
+
+void drawAdminWeightsScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("USER WEIGHTS");
+
+    int total = USER_COUNT + 1;
+    int visEnd = min(adminEditUser / USER_VISIBLE * USER_VISIBLE + USER_VISIBLE, total);
+    int visStart = visEnd - USER_VISIBLE;
+    if (visStart < 0) visStart = 0;
+
+    for (int i = visStart; i < min(visStart + USER_VISIBLE, total); i++) {
+        int row = i - visStart;
+        int y = 26 + row * 26;
+        bool isGuest = (i == USER_COUNT);
+        const char* name = isGuest ? "Guest" : userNames[i];
+
+        if (i == adminEditUser) {
+            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 24, COL_HEADER_BG);
+            tft.setTextColor(COL_ACCENT);
+        } else {
+            tft.setTextColor(COL_LABEL);
+        }
+        tft.setTextSize(1);
+        tft.setCursor(6, y);
+        tft.print(name);
+        tft.setTextSize(2);
+        tft.setTextColor(i == adminEditUser ? COL_VALUE : COL_DIVIDER);
+        tft.setCursor(TFT_WIDTH - 48, y);
+        tft.printf("%.0f", userWeights[i]);
+        tft.setTextSize(1);
+        tft.setTextColor(COL_LABEL);
+        tft.print("kg");
+    }
+    drawKeyHints("UP", "DN", "BACK", "EDIT");
+}
+
+void drawAdminWeightEditScreen() {
+    tft.fillScreen(COL_BG);
+    bool isGuest = (adminEditUser == USER_COUNT);
+    const char* name = isGuest ? "Guest" : userNames[adminEditUser];
+
+    drawHeader("EDIT WEIGHT");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_ACCENT);
+    tft.setCursor(4, 24);
+    tft.print(name);
+
+    tft.setTextSize(3);
+    tft.setTextColor(COL_VALUE);
+    tft.setCursor(20, 50);
+    tft.printf("%.0f", userWeights[adminEditUser]);
+    tft.setTextSize(2);
+    tft.print(" kg");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 100);
+    tft.print("\x18 +1 kg    \x19 -1 kg");
+
+    drawKeyHints("+1", "-1", "BACK", "SAVE");
+}
+
 void drawCalibAuthScreen() {
     tft.fillScreen(COL_BG);
     drawHeader("ADMIN ACCESS");
@@ -1210,7 +1316,8 @@ void processSensor() {
         uint32_t newPulses = pulseCount - totalPulses;
         totalPulses = pulseCount;
         totalMeters += newPulses * calMetersPerPulse;
-        totalCalories = totalMeters * CAL_PER_METER;
+        // calories: weight-based estimate (0.571 kcal per kg per km)
+        totalCalories = totalMeters * userWeights[currentUser] * 0.000571f;
 
         // Speed from last pulse interval
         if (lastPulseIntervalMs > 0) {
@@ -1286,7 +1393,8 @@ void handleInput() {
                         if (pwdBuffer[i] != calibPassword[i]) { ok = false; break; }
                     if (ok) {
                         playTone(1600, 100);
-                        currentScreen = SCR_CALIB;
+                        adminMenuItem = 0;
+                        currentScreen = SCR_ADMIN_MENU;
                     } else {
                         pwdWrong = true;
                         pwdPos = 0;
@@ -1297,18 +1405,51 @@ void handleInput() {
         }
         break;
 
+    case SCR_ADMIN_MENU:
+        if (consume(btnUp))   { if (adminMenuItem > 0) adminMenuItem--; }
+        if (consume(btnDown)) { if (adminMenuItem < ADMIN_MENU_COUNT - 1) adminMenuItem++; }
+        if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
+        if (consume(btnStar)) {
+            beep();
+            if (adminMenuItem == 0) currentScreen = SCR_CALIB;
+            else if (adminMenuItem == 1) { adminEditUser = 0; currentScreen = SCR_ADMIN_WEIGHTS; }
+        }
+        break;
+
     case SCR_CALIB:
         if (consume(btnUp))   { calMetersPerPulse += 0.000001f; }
         if (consume(btnDown)) { if (calMetersPerPulse > 0.000001f) calMetersPerPulse -= 0.000001f; }
         if (consume(btnStar)) {
             saveCalibration();
             playTone(TONE_UPLOAD, 200);
-            currentScreen = SCR_IDLE;
+            currentScreen = SCR_ADMIN_MENU;
         }
         if (consume(btnHash)) {
-            loadCalibration();  // revert unsaved changes
+            loadCalibration();
             beep();
-            currentScreen = SCR_IDLE;
+            currentScreen = SCR_ADMIN_MENU;
+        }
+        break;
+
+    case SCR_ADMIN_WEIGHTS:
+        if (consume(btnUp))   { if (adminEditUser > 0) adminEditUser--; }
+        if (consume(btnDown)) { if (adminEditUser < USER_COUNT) adminEditUser++; }
+        if (consume(btnHash)) { beep(); currentScreen = SCR_ADMIN_MENU; }
+        if (consume(btnStar)) { beep(); currentScreen = SCR_ADMIN_WEIGHT_EDIT; }
+        break;
+
+    case SCR_ADMIN_WEIGHT_EDIT:
+        if (consume(btnUp))   { userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 1.0f); }
+        if (consume(btnDown)) { userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 1.0f); }
+        if (consume(btnStar)) {
+            saveWeights();
+            playTone(TONE_UPLOAD, 200);
+            currentScreen = SCR_ADMIN_WEIGHTS;
+        }
+        if (consume(btnHash)) {
+            loadCalibration();  // revert
+            beep();
+            currentScreen = SCR_ADMIN_WEIGHTS;
         }
         break;
 
@@ -1395,8 +1536,11 @@ void refreshDisplay() {
         case SCR_WORKOUT:     drawWorkoutScreen(); break;
         case SCR_PAUSED:      drawPausedScreen(); break;
         case SCR_HISTORY:     drawHistoryScreen(); break;
-        case SCR_CALIB_AUTH:  drawCalibAuthScreen(); break;
-        case SCR_CALIB:       drawCalibScreen(); break;
+        case SCR_CALIB_AUTH:        drawCalibAuthScreen(); break;
+        case SCR_ADMIN_MENU:        drawAdminMenuScreen(); break;
+        case SCR_CALIB:             drawCalibScreen(); break;
+        case SCR_ADMIN_WEIGHTS:     drawAdminWeightsScreen(); break;
+        case SCR_ADMIN_WEIGHT_EDIT: drawAdminWeightEditScreen(); break;
         default: break;
     }
 }
