@@ -1426,7 +1426,12 @@ void handleInput() {
                 comboPos = 0;
                 pwdPos = 0; pwdWrong = false;
                 beep(); delay(80); beep();
+#if CALIB_REQUIRE_PASSWORD
                 currentScreen = SCR_CALIB_AUTH;
+#else
+                adminMenuItem = 0;
+                currentScreen = SCR_ADMIN_MENU;   // no password: combo opens admin directly
+#endif
             } else {
                 beep();
                 currentUser = 0;

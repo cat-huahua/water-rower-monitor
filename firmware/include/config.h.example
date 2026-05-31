@@ -82,6 +82,18 @@
 #define TONE_UPLOAD   2000   // Hz
 #define TONE_DURATION 150    // ms
 
+// ===== Admin / Calibration access =====
+// A secret button combo on the IDLE screen opens admin mode.
+// Buttons: 0=UP(K1)  1=DOWN(K2)  2=#(K3)  3=*(K4).
+// The combo MUST end with 3 (*), the key that triggers the check.
+#define CALIB_COMBO            {0,1,0,1,2,3}
+#define CALIB_COMBO_LEN        6
+// Password AFTER the combo. Default: NO password — the combo alone opens admin.
+// Set CALIB_REQUIRE_PASSWORD to 1 to require the password below.
+#define CALIB_REQUIRE_PASSWORD 0
+#define CALIB_PASSWORD         {3,2,1,0}
+#define CALIB_PASSWORD_LEN     4
+
 // ===== Calibration =====
 #define PULSES_PER_REV      60                  // 60 teeth -> 60 pulses per paddle revolution
 

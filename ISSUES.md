@@ -15,6 +15,7 @@
 | 7 | 用 recovery 段估算有效阻力系数 k_eff，做慢速自标定 | enhancement | P2 |
 | 8 | `CAL_PER_METER` 死常量，与实际卡路里公式不一致 | cleanup | P2 |
 | 9 | BLE 总距离字段 16-bit，>65535 m 回绕 | bug | P3 |
+| 10 | `config.h.example` 缺 CALIB_* 宏（全新 clone 编译失败）；admin 默认免密 | bug/feat | P1 |
 
 ---
 
@@ -183,6 +184,19 @@ FTMS 总距离是 uint24，但代码高字节恒 0，距离超 65.5 km 回绕（
 
 **建议修复**
 正确填充 uint24 第三字节：`data[idx++] = ((uint32_t)totalMeters >> 16) & 0xFF;`
+
+---
+
+## #10 — config.h.example 缺 CALIB 宏 + admin 默认免密 — P1
+
+**位置** [`config.h.example`](firmware/include/config.h.example)（原先缺 `CALIB_COMBO/_LEN`、`CALIB_PASSWORD/_LEN`）
+
+**现象** admin/calib 功能的提交加了代码但没更新模板 → **全新 clone 编译失败**。
+
+**修复（已做）**
+- 补全 4 个 CALIB 宏；
+- 新增开关 `CALIB_REQUIRE_PASSWORD`，**默认 `0`（不要密码）** —— 暗号组合直接进 admin 菜单；置 `1` 才要密码。
+- `main.cpp` 用 `#if CALIB_REQUIRE_PASSWORD` 决定走密码屏还是直进菜单；未定义时按 0 处理（旧 config.h 自动免密）。
 
 ---
 
