@@ -338,7 +338,11 @@ unsigned long lastPulseMs = 0;
 unsigned long lastPulseIntervalMs = 0;
 
 #ifdef SENSOR_TYPE_LDR
-bool     ldrPulseActive = false;
+volatile bool          ldrPulseActive     = false;
+volatile unsigned long ldrPulseCount      = 0;
+volatile unsigned long ldrLastPulseUs     = 0;
+volatile unsigned long ldrPulseIntervalUs = 0;
+hw_timer_t*            ldrTimer           = nullptr;
 #endif
 
 #ifdef SENSOR_TYPE_HALL
@@ -354,7 +358,7 @@ volatile unsigned long blockerPulseIntervalUs = 0;
 #endif
 
 // ───────── Workout state ─────────
-bool     workoutActive  = false;
+volatile bool workoutActive = false;    // volatile: read by the LDR sampling ISR
 uint32_t totalPulses    = 0;
 float    totalMeters    = 0;
 float    totalCalories  = 0;
@@ -442,24 +446,39 @@ void setBacklight(uint8_t val) {
 // ───────── Sensor Reading ─────────
 
 #ifdef SENSOR_TYPE_LDR
+// LDR is sampled by a 1 kHz hardware-timer ISR so pulses are never lost while the
+// loop is busy (the periodic full-screen redraw blocks the loop for ~10-20 ms).
+// The ISR only touches the ADC while a workout is active — the one window in which
+// no flash/NVS writes happen — so analogRead() from the ISR is safe in this firmware.
+void IRAM_ATTR ldrSampleISR() {
+    if (!workoutActive) return;
+    int val = analogRead(LDR_SIGNAL_PIN);
+    if (!ldrPulseActive && val < (LDR_THRESHOLD - LDR_HYSTERESIS)) {
+        ldrPulseActive = true;                       // falling edge: paddle passing
+        unsigned long now = micros();
+        if (ldrLastPulseUs > 0) ldrPulseIntervalUs = now - ldrLastPulseUs;
+        ldrLastPulseUs = now;
+        ldrPulseCount++;
+    } else if (ldrPulseActive && val > (LDR_THRESHOLD + LDR_HYSTERESIS)) {
+        ldrPulseActive = false;                      // rising edge: light restored
+    }
+}
+
 void readSensor() {
     if (!workoutActive) return;
 
-    int val = analogRead(LDR_SIGNAL_PIN);
+    noInterrupts();
+    unsigned long pc = ldrPulseCount;
+    unsigned long interval = ldrPulseIntervalUs;
+    interrupts();
 
-    // Detect falling edge: light blocked → paddle passing
-    if (!ldrPulseActive && val < (LDR_THRESHOLD - LDR_HYSTERESIS)) {
-        ldrPulseActive = true;
+    if (pc > pulseCount) {
         unsigned long now = millis();
         if (lastPulseMs > 0) {
-            lastPulseIntervalMs = now - lastPulseMs;
+            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
         }
         lastPulseMs = now;
-        pulseCount++;
-    }
-    // Detect rising edge: light restored → paddle passed
-    else if (ldrPulseActive && val > (LDR_THRESHOLD + LDR_HYSTERESIS)) {
-        ldrPulseActive = false;
+        pulseCount = pc;
     }
 }
 
@@ -579,7 +598,7 @@ void updateBLE() {
     // Flags (2 bytes) + fields
     unsigned long elapsed = workoutElapsedMs + (millis() - workoutStartMs);
     uint16_t strokeRateX2 = (uint16_t)(strokeRate * 2);  // 0.5 resolution
-    uint16_t totalDist = (uint16_t)totalMeters;           // meters (wraps at 65535)
+    uint32_t totalDist = (uint32_t)totalMeters;           // FTMS total distance is uint24 (m)
     uint16_t paceS500 = 0;
     if (currentSpeed > 0.1f) {
         paceS500 = (uint16_t)(500.0f / currentSpeed);    // seconds per 500m
@@ -613,7 +632,7 @@ void updateBLE() {
     // Total distance (uint24, little endian)
     data[idx++] = totalDist & 0xFF;
     data[idx++] = (totalDist >> 8) & 0xFF;
-    data[idx++] = 0; // high byte
+    data[idx++] = (totalDist >> 16) & 0xFF;
     // Instantaneous pace (uint16, seconds per 500m)
     data[idx++] = paceS500 & 0xFF;
     data[idx++] = (paceS500 >> 8) & 0xFF;
@@ -1313,6 +1332,7 @@ void resetWorkout() {
     lastPulseIntervalMs = 0;
 #ifdef SENSOR_TYPE_LDR
     ldrPulseActive = false;
+    ldrPulseCount = 0; ldrLastPulseUs = 0; ldrPulseIntervalUs = 0;
 #endif
 #ifdef SENSOR_TYPE_HALL
     hallPulseCount = 0;
@@ -1673,6 +1693,11 @@ void setup() {
 #ifdef SENSOR_TYPE_LDR
     pinMode(LDR_SIGNAL_PIN, INPUT);
     analogSetAttenuation(ADC_11db);  // full 0-3.3V range
+    // 1 kHz timer-driven sampling (immune to loop/redraw stalls); see ldrSampleISR
+    ldrTimer = timerBegin(0, 80, true);              // 80 MHz / 80 = 1 MHz tick
+    timerAttachInterrupt(ldrTimer, &ldrSampleISR, true);
+    timerAlarmWrite(ldrTimer, 1000, true);           // 1000 us -> 1 kHz
+    timerAlarmEnable(ldrTimer);
 #endif
 #ifdef SENSOR_TYPE_HALL
     pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
