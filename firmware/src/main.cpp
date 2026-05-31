@@ -368,6 +368,12 @@ bool     inDrive = false;               // true during drive phase (flywheel acc
 float    emaIntervalMs   = 0;           // smoothed pulse interval (ms); omega ~ 1/interval
 float    extremaInterval = 0;           // turning-point interval for stroke detection
 float    emaSpeed        = 0;           // smoothed boat speed (m/s)
+// SPM averaged over a trailing window of >= SPM_WINDOW_MS (tune here)
+#define  SPM_WINDOW_MS   10000
+#define  STROKE_TS_MAX   32
+unsigned long strokeTimes[STROKE_TS_MAX] = {};
+int      strokeTsHead  = 0;             // ring: next write index
+int      strokeTsCount = 0;             // ring: valid entries
 
 // History
 #define MAX_HISTORY 10
@@ -1302,6 +1308,7 @@ void resetWorkout() {
     workoutElapsedMs = 0; lastPulseMs = 0;
     lastStrokeBoundary = 0; inDrive = false;
     emaIntervalMs = 0; extremaInterval = 0; emaSpeed = 0;
+    strokeTsHead = 0; strokeTsCount = 0;
     pulseCount = 0; displayPage = 0;
     lastPulseIntervalMs = 0;
 #ifdef SENSOR_TYPE_LDR
@@ -1313,6 +1320,25 @@ void resetWorkout() {
 #ifdef SENSOR_TYPE_BLOCKER
     blockerPulseCount = 0;
 #endif
+}
+
+// ───────── SPM over a trailing window (>= SPM_WINDOW_MS) ─────────
+// Walk back through recorded stroke times until the span covers the window
+// (or the ring is exhausted); rate = intervals / span. Averages >= 10 s.
+float computeSpm() {
+    if (strokeTsCount < 2) return strokeRate;   // need >= 2 strokes for an interval
+    int newest = (strokeTsHead - 1 + STROKE_TS_MAX) % STROKE_TS_MAX;
+    unsigned long tNew = strokeTimes[newest];
+    unsigned long tOld = tNew;
+    int n = 1;
+    for (int k = 1; k < strokeTsCount; k++) {
+        int j = (newest - k + STROKE_TS_MAX) % STROKE_TS_MAX;
+        tOld = strokeTimes[j];
+        n++;
+        if (tNew - tOld >= SPM_WINDOW_MS) break;   // window covered
+    }
+    if (tNew <= tOld) return strokeRate;
+    return (float)(n - 1) * 60000.0f / (float)(tNew - tOld);
 }
 
 // ───────── Process sensor data ─────────
@@ -1351,13 +1377,15 @@ void processSensor() {
                     emaIntervalMs < extremaInterval * (1.0f - STROKE_HYST) &&
                     (now - lastStrokeBoundary > STROKE_MIN_MS)) {
                     inDrive = true;
-                    if (lastStrokeBoundary > 0) {
-                        float instSpm = 60000.0f / (float)(now - lastStrokeBoundary);
-                        strokeRate = (strokeRate > 0) ? (0.7f * strokeRate + 0.3f * instSpm) : instSpm;
-                    }
                     lastStrokeBoundary = now;
                     strokeCount++;
                     extremaInterval = emaIntervalMs;   // now track the min during drive
+
+                    // record stroke time; SPM = average over >= SPM_WINDOW_MS
+                    strokeTimes[strokeTsHead] = now;
+                    strokeTsHead = (strokeTsHead + 1) % STROKE_TS_MAX;
+                    if (strokeTsCount < STROKE_TS_MAX) strokeTsCount++;
+                    strokeRate = computeSpm();
                 }
             } else {
                 // drive: track the min interval; a rise past hysteresis = recovery start
@@ -1379,6 +1407,7 @@ void processSensor() {
         extremaInterval = 0;
         inDrive = false;
         lastStrokeBoundary = 0;   // next stroke after idle won't compute a bogus SPM
+        strokeTsHead = 0; strokeTsCount = 0;
     }
 }
 
