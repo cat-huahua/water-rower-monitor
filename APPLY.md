@@ -355,10 +355,10 @@ pio device monitor        # 看调试输出
 5. 计算:
 
 ```
-新值 = 实际距离 / 屏幕显示距离 × 0.00875
+新 METERS_PER_REV = 当前 METERS_PER_REV × (实际距离 / 屏幕显示距离)
 ```
 
-6. 改 `config.h` 的 `METERS_PER_PULSE` → 重新烧录
+6. 改 `config.h` 的 `METERS_PER_REV` → 重新烧录
 
 ---
 

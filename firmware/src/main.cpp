@@ -273,6 +273,9 @@ float userWeights[USER_COUNT + 1];   // +1 for Guest (index USER_COUNT)
 void loadCalibration() {
     prefs.begin("wrower", true);
     calMetersPerPulse = prefs.getFloat("mpp", METERS_PER_PULSE);
+    // Heal implausible stored values (e.g. old 60x-too-small calibration)
+    if (calMetersPerPulse < 0.002f || calMetersPerPulse > 0.1f)
+        calMetersPerPulse = METERS_PER_PULSE;
     for (int i = 0; i <= USER_COUNT; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
         userWeights[i] = prefs.getFloat(key, 70.0f);
@@ -360,8 +363,11 @@ float    currentSpeed   = 0;
 float    strokeRate     = 0;
 unsigned long workoutStartMs   = 0;
 unsigned long workoutElapsedMs = 0;
-unsigned long lastStrokeBoundary = 0;
-bool     inStroke = false;
+unsigned long lastStrokeBoundary = 0;   // time of last drive (pull) start, for SPM
+bool     inDrive = false;               // true during drive phase (flywheel accelerating)
+float    emaIntervalMs   = 0;           // smoothed pulse interval (ms); omega ~ 1/interval
+float    extremaInterval = 0;           // turning-point interval for stroke detection
+float    emaSpeed        = 0;           // smoothed boat speed (m/s)
 
 // History
 #define MAX_HISTORY 10
@@ -1294,7 +1300,8 @@ void resetWorkout() {
     totalPulses = 0; totalMeters = 0; totalCalories = 0;
     strokeCount = 0; currentSpeed = 0; strokeRate = 0;
     workoutElapsedMs = 0; lastPulseMs = 0;
-    lastStrokeBoundary = 0; inStroke = false;
+    lastStrokeBoundary = 0; inDrive = false;
+    emaIntervalMs = 0; extremaInterval = 0; emaSpeed = 0;
     pulseCount = 0; displayPage = 0;
     lastPulseIntervalMs = 0;
 #ifdef SENSOR_TYPE_LDR
@@ -1316,38 +1323,62 @@ void processSensor() {
         uint32_t newPulses = pulseCount - totalPulses;
         totalPulses = pulseCount;
         totalMeters += newPulses * calMetersPerPulse;
-        // calories: weight-based estimate (0.571 kcal per kg per km)
+        // calories: weight-based estimate (~0.571 kcal per kg per km)
         totalCalories = totalMeters * userWeights[currentUser] * 0.000571f;
 
-        // Speed from last pulse interval
+        unsigned long now = millis();
+
+        // Smooth the single-pulse interval (raw value is very noisy)
         if (lastPulseIntervalMs > 0) {
-            currentSpeed = calMetersPerPulse / (lastPulseIntervalMs / 1000.0f);
+            float iv = (float)lastPulseIntervalMs;
+            emaIntervalMs = (emaIntervalMs > 0) ? (0.6f * emaIntervalMs + 0.4f * iv) : iv;
+
+            // Boat speed from smoothed angular velocity (omega ~ 1/interval), then smooth again
+            float spd = calMetersPerPulse / (emaIntervalMs / 1000.0f);
+            emaSpeed = (emaSpeed > 0) ? (0.7f * emaSpeed + 0.3f * spd) : spd;
+            currentSpeed = emaSpeed;
         }
 
-        // Stroke detection
-        unsigned long now = millis();
-        if (!inStroke) {
-            inStroke = true;
-            if (lastStrokeBoundary > 0) {
-                unsigned long strokeInterval = now - lastStrokeBoundary;
-                if (strokeInterval > 0) {
-                    strokeRate = 60000.0f / strokeInterval;
+        // ── Stroke detection by flywheel accel/decel (peak/valley of omega) ──
+        //   interval shrinking -> flywheel speeding up -> DRIVE (pull)
+        //   interval growing   -> flywheel coasting    -> RECOVERY
+        // A new stroke = recovery->drive reversal (interval turns from rising to falling).
+        if (emaIntervalMs > 0) {
+            if (!inDrive) {
+                // recovery: track the max interval; a drop past hysteresis = drive start
+                if (emaIntervalMs > extremaInterval) extremaInterval = emaIntervalMs;
+                if (extremaInterval > 0 &&
+                    emaIntervalMs < extremaInterval * (1.0f - STROKE_HYST) &&
+                    (now - lastStrokeBoundary > STROKE_MIN_MS)) {
+                    inDrive = true;
+                    if (lastStrokeBoundary > 0) {
+                        float instSpm = 60000.0f / (float)(now - lastStrokeBoundary);
+                        strokeRate = (strokeRate > 0) ? (0.7f * strokeRate + 0.3f * instSpm) : instSpm;
+                    }
+                    lastStrokeBoundary = now;
+                    strokeCount++;
+                    extremaInterval = emaIntervalMs;   // now track the min during drive
+                }
+            } else {
+                // drive: track the min interval; a rise past hysteresis = recovery start
+                if (emaIntervalMs < extremaInterval || extremaInterval == 0) extremaInterval = emaIntervalMs;
+                if (emaIntervalMs > extremaInterval * (1.0f + STROKE_HYST)) {
+                    inDrive = false;
+                    extremaInterval = emaIntervalMs;   // now track the max during recovery
                 }
             }
-            lastStrokeBoundary = now;
-            strokeCount++;
         }
     }
 
-    // Stroke boundary (gap in pulses)
-    if (inStroke && lastPulseMs > 0 && (millis() - lastPulseMs > STROKE_GAP_MS)) {
-        inStroke = false;
-    }
-
-    // Idle detection
+    // Idle detection: no pulses for a while -> stop dynamics (distance & count are kept)
     if (lastPulseMs > 0 && (millis() - lastPulseMs > IDLE_TIMEOUT_MS)) {
         currentSpeed = 0;
         strokeRate = 0;
+        emaSpeed = 0;
+        emaIntervalMs = 0;
+        extremaInterval = 0;
+        inDrive = false;
+        lastStrokeBoundary = 0;   // next stroke after idle won't compute a bogus SPM
     }
 }
 
