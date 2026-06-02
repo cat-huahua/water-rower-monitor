@@ -366,19 +366,20 @@ module battery_door() {
 }
 
 // ===== Render =====
-// Export each part separately: comment others, F6, F7
+// PART=0: all (preview), 1: bottom_case, 2: lid, 3: tube_socket, 4: battery_door
+// CLI export: openscad -o lid.stl -D "PART=2" enclosure.scad
+PART = 0;
 
-// Part 1: Bottom case
-bottom_case();
+if (PART == 0 || PART == 1) bottom_case();
 
-// Part 2: Lid (TFT window + screw holes)
-translate([0, outer_l + 15, 0])
-    lid();
+if (PART == 0 || PART == 2)
+    translate([PART == 0 ? 0 : 0, PART == 0 ? outer_l + 15 : 0, 0])
+        lid();
 
-// Part 3: Tube socket (18mm tube mount)
-translate([outer_w + 30, outer_l / 2, 0])
-    tube_socket();
+if (PART == 0 || PART == 3)
+    translate([PART == 0 ? outer_w + 30 : 0, PART == 0 ? outer_l / 2 : 0, 0])
+        tube_socket();
 
-// Part 4: Battery door (slide-in cap)
-translate([0, -30, 0])
-    battery_door();
+if (PART == 0 || PART == 4)
+    translate([PART == 0 ? 0 : 0, PART == 0 ? -30 : 0, 0])
+        battery_door();

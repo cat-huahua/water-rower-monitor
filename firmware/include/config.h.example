@@ -20,6 +20,13 @@
 #define USER_COUNT 2
 #define USER_NAMES {"User1", "User2"}
 
+// ===== Default weight (kg) — used when no NVS value saved yet =====
+#define DEFAULT_WEIGHT_KG 70.0f
+
+// ===== Per-user passwords (button IDs: 0=UP 1=DN 2=# 3=*) =====
+#define USER_PASSWORD_LEN 4
+#define USER_PASSWORDS { {1,2,3,0}, {0,3,2,1} }
+
 // ===== ST7735S TFT Pins (SPI — ESP32-S3) =====
 #define TFT_CS        GPIO_NUM_10
 #define TFT_RST       GPIO_NUM_9
