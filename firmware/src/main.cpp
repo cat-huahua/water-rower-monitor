@@ -324,6 +324,11 @@ int adminMenuItem  = 0;   // selected menu item
 int adminEditUser  = 0;   // user being edited in weight screen
 #define ADMIN_MENU_COUNT 2
 
+// Long-press * on the idle screen opens admin (robust entry: the combo is
+// easy to fumble because # and a failed * both navigate away from idle).
+#define ADMIN_HOLD_MS 3000
+unsigned long starPressMs = 0;   // press-edge time of * on idle; 0 = not armed
+
 // ───────── State machine ─────────
 enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
               SCR_UPLOADING, SCR_HISTORY,
@@ -704,7 +709,7 @@ String getTimestamp() {
 }
 
 // ───────── TrueNAS Upload (plain HTTP, local network) ─────────
-bool uploadToGitHub(uint32_t durSec) {
+bool uploadToNAS(uint32_t durSec) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) return false;
 
@@ -1091,7 +1096,7 @@ void drawUploadingScreen() {
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(10, 85);
-    tft.print("Sending to GitHub...");
+    tft.print("Sending to NAS...");
     tft.setCursor(10, 100);
     tft.print("Don't pull the plug!");
 
@@ -1478,6 +1483,20 @@ void processSensor() {
     }
 }
 
+// ───────── Admin entry ─────────
+void enterAdmin() {
+    memset(comboBuffer, 0, sizeof(comboBuffer));
+    comboPos = 0;
+    pwdPos = 0; pwdWrong = false;
+    beep(); delay(80); beep();
+#if CALIB_REQUIRE_PASSWORD
+    currentScreen = SCR_CALIB_AUTH;
+#else
+    adminMenuItem = 0;
+    currentScreen = SCR_ADMIN_MENU;   // no password: open admin directly
+#endif
+}
+
 // ───────── Handle input ─────────
 void handleInput() {
     switch (currentScreen) {
@@ -1485,25 +1504,28 @@ void handleInput() {
         if (consume(btnUp))   { pushCombo(0); brightness = min(255, brightness + 25); setBacklight(brightness); }
         if (consume(btnDown)) { pushCombo(1); brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); }
         if (consume(btnHash)) { pushCombo(2); beep(); displayPage = 0; currentScreen = SCR_HISTORY; }
-        if (consume(btnStar)) {
-            pushCombo(3);
-            if (checkCombo()) {
-                // Secret combo entered → go to admin auth
-                memset(comboBuffer, 0, sizeof(comboBuffer));
-                comboPos = 0;
-                pwdPos = 0; pwdWrong = false;
-                beep(); delay(80); beep();
-#if CALIB_REQUIRE_PASSWORD
-                currentScreen = SCR_CALIB_AUTH;
-#else
-                adminMenuItem = 0;
-                currentScreen = SCR_ADMIN_MENU;   // no password: combo opens admin directly
-#endif
-            } else {
-                beep();
-                currentUser = 0;
-                userScrollOffset = 0;
-                currentScreen = SCR_USER_SELECT;
+        // * on idle: act on RELEASE so a held key can mean something different.
+        //   hold >= ADMIN_HOLD_MS          -> admin
+        //   short press after CALIB_COMBO  -> admin (legacy combo path)
+        //   short press otherwise          -> user select (start workout)
+        if (consume(btnStar)) starPressMs = millis();   // arm on press edge
+        if (starPressMs != 0) {
+            if (digitalRead(BTN_STAR_PIN) == LOW) {
+                if (millis() - starPressMs >= ADMIN_HOLD_MS) {
+                    starPressMs = 0;
+                    enterAdmin();                       // long press: admin
+                }
+            } else {                                    // released early: short press
+                starPressMs = 0;
+                if (checkCombo()) {
+                    enterAdmin();
+                } else {
+                    pushCombo(3);   // pollute the buffer: a normal * resets combo entry
+                    beep();
+                    currentUser = 0;
+                    userScrollOffset = 0;
+                    currentScreen = SCR_USER_SELECT;
+                }
             }
         }
         break;
@@ -1815,11 +1837,11 @@ void loop() {
         saveToHistory(durSec);
         bool ok = false;
         if (currentUser == USER_COUNT) {
-            // Guest: screen + BLE only, no GitHub
+            // Guest: screen + BLE only, no NAS upload
             beep();
         } else {
             drawUploadingScreen();
-            ok = uploadToGitHub(durSec);
+            ok = uploadToNAS(durSec);
             if (ok) {
                 playTone(TONE_UPLOAD, 200);
             } else {
