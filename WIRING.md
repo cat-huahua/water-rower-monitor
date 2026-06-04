@@ -128,9 +128,9 @@ K4               →   GPIO 15  (*)
 |------|------|--------|
 | `LDR_THRESHOLD` | LDR 脉冲检测阈值 (0-4095) | `2000` |
 | `LDR_HYSTERESIS` | 防抖动余量 | `300` |
-| `METERS_PER_PULSE` | 每个脉冲对应的米数 | `0.00875f` |
-| `STROKE_GAP_MS` | 划桨间隙检测 (ms) | `500` |
-| `CAL_PER_METER` | 每米消耗卡路里 | `0.04f` |
+| `METERS_PER_REV` | 每圈(60脉冲)行进米数 — **标定量** | `1.4f` |
+| `STROKE_MIN_MS` | 两桨最小间隔 (ms, ~100SPM 上限) | `600` |
+| `STROKE_HYST` | drive/recovery 翻转阈值 (比例) | `0.06f` |
 
 ### enclosure.scad — 根据实物调
 
@@ -153,5 +153,5 @@ K4               →   GPIO 15  (*)
 2. 转动飞轮, 观察值的变化范围
 3. 设 `LDR_THRESHOLD` 为亮/暗中间值
 4. 按 * 开始训练, 划 10 桨, 记下距离
-5. 计算: `新值 = 实际距离 / 屏幕距离 × 0.00875`
-6. 改 config.h, 重新烧录
+5. 计算: `新 METERS_PER_REV = 当前 METERS_PER_REV × (实际距离 / 屏幕距离)`
+6. 改 config.h 的 `METERS_PER_REV`, 重新烧录

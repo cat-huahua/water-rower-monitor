@@ -25,9 +25,7 @@
 #include <Preferences.h>
 #include <SPI.h>
 #include <WiFi.h>
-#include <WiFiClientSecure.h>
 #include <HTTPClient.h>
-#include "esp_http_client.h"
 #include <Adafruit_GFX.h>
 #include <Adafruit_ST7735.h>
 #include <ArduinoJson.h>
@@ -37,9 +35,6 @@
 #include <BLEUtils.h>
 #include <BLE2902.h>
 #include "config.h"
-#include "soc/soc.h"
-#include "soc/rtc_cntl_reg.h"
-#include "esp_bt.h"
 
 // Compile-time sensor check
 #if !defined(SENSOR_TYPE_LDR) && !defined(SENSOR_TYPE_HALL) && !defined(SENSOR_TYPE_BLOCKER)
@@ -211,10 +206,10 @@ static const char* const idle_msgs[] = {
     "The water awaits...",
     "Don't be lazy!",
     "Let's GOOO!",
-    "Burn those calories!",
-    "Muscles miss you!",
+    "Calories won't burn\nthemselves",
+    "Your muscles miss you",
     "Row or regret?",
-    "One more session!",
+    "Just one more session",
 };
 #define NUM_IDLE_MSGS 8
 
@@ -273,23 +268,23 @@ int userScrollOffset = 0;
 // ───────── NVS / Calibration ─────────
 Preferences prefs;
 float calMetersPerPulse = METERS_PER_PULSE;
-uint16_t strokeGapMs    = STROKE_GAP_MS;
 float userWeights[USER_COUNT + 1];   // +1 for Guest (index USER_COUNT)
 
 void loadCalibration() {
     prefs.begin("wrower", true);
     calMetersPerPulse = prefs.getFloat("mpp", METERS_PER_PULSE);
-    strokeGapMs       = prefs.getUShort("sgap", STROKE_GAP_MS);
+    // Heal implausible stored values (e.g. old 60x-too-small calibration)
+    if (calMetersPerPulse < 0.002f || calMetersPerPulse > 0.1f)
+        calMetersPerPulse = METERS_PER_PULSE;
     for (int i = 0; i <= USER_COUNT; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
-        userWeights[i] = prefs.getFloat(key, DEFAULT_WEIGHT_KG);
+        userWeights[i] = prefs.getFloat(key, 70.0f);
     }
     prefs.end();
 }
 void saveCalibration() {
     prefs.begin("wrower", false);
     prefs.putFloat("mpp", calMetersPerPulse);
-    prefs.putUShort("sgap", strokeGapMs);
     prefs.end();
 }
 void saveWeights() {
@@ -308,12 +303,8 @@ static const uint8_t calibPassword[] = CALIB_PASSWORD;
 uint8_t comboBuffer[CALIB_COMBO_LEN] = {};
 uint8_t comboPos = 0;
 uint8_t pwdBuffer[CALIB_PASSWORD_LEN] = {};
-uint8_t pwdPos        = 0;
-bool    pwdWrong      = false;
-uint8_t pwdWrongCount = 0;
-unsigned long pwdLockUntilMs = 0;
-char pwdAttemptTimes[3][32] = {};
-uint8_t pwdAttemptKeys[3][CALIB_PASSWORD_LEN] = {};
+uint8_t pwdPos   = 0;
+bool    pwdWrong = false;
 
 void pushCombo(uint8_t btn) {
     // Shift buffer
@@ -328,96 +319,16 @@ bool checkCombo() {
     return true;
 }
 
-// ───────── Per-user auth ─────────
-uint8_t userPasswords[USER_COUNT][USER_PASSWORD_LEN];
-
-void loadPasswords() {
-    static const uint8_t defaults[USER_COUNT][USER_PASSWORD_LEN] = USER_PASSWORDS;
-    prefs.begin("wrower", true);
-    for (int i = 0; i < USER_COUNT; i++) {
-        char key[5]; snprintf(key, sizeof(key), "pw%d", i);
-        if (prefs.getBytesLength(key) == USER_PASSWORD_LEN)
-            prefs.getBytes(key, userPasswords[i], USER_PASSWORD_LEN);
-        else
-            memcpy(userPasswords[i], defaults[i], USER_PASSWORD_LEN);
-    }
-    prefs.end();
-}
-void savePassword(int userIdx) {
-    prefs.begin("wrower", false);
-    char key[5]; snprintf(key, sizeof(key), "pw%d", userIdx);
-    prefs.putBytes(key, userPasswords[userIdx], USER_PASSWORD_LEN);
-    prefs.end();
-}
-// Returns true if this user has no password (all bytes == 0xFF)
-bool userNoPassword(int u) {
-    for (int i = 0; i < USER_PASSWORD_LEN; i++)
-        if (userPasswords[u][i] != 0xFF) return false;
-    return true;
-}
-
-uint8_t  userPwdPos        = 0;
-bool     userPwdWrong      = false;
-uint8_t  userPwdBuffer[USER_PASSWORD_LEN] = {};
-uint8_t  userWrongCount[USER_COUNT]       = {};
-unsigned long userLockUntilMs[USER_COUNT] = {};
-char     userAttemptTimes[USER_COUNT][3][32] = {};
-uint8_t  userAttemptKeys[USER_COUNT][3][USER_PASSWORD_LEN] = {};
-
-String getTimestamp();  // forward declaration
-
-// ───────── Suspicious log (last 5 lockout events) ─────────
-#define SUSPICIOUS_MAX 5
-struct SuspiciousEntry {
-    char name[16];
-    char time[32];
-};
-SuspiciousEntry suspiciousLog[SUSPICIOUS_MAX];
-int suspiciousCount = 0;
-int suspiciousHead  = 0;
-
-void addSuspicious(const char* name) {
-    int idx = suspiciousHead % SUSPICIOUS_MAX;
-    strncpy(suspiciousLog[idx].name, name, sizeof(suspiciousLog[idx].name) - 1);
-    suspiciousLog[idx].name[sizeof(suspiciousLog[idx].name) - 1] = '\0';
-    String ts = getTimestamp();
-    strncpy(suspiciousLog[idx].time, ts.c_str(), sizeof(suspiciousLog[idx].time) - 1);
-    suspiciousLog[idx].time[sizeof(suspiciousLog[idx].time) - 1] = '\0';
-    suspiciousHead++;
-    if (suspiciousCount < SUSPICIOUS_MAX) suspiciousCount++;
-}
-
-void appendSuspiciousJson(JsonDocument& doc) {
-    JsonArray arr = doc.createNestedArray("suspicious_history");
-    int total = suspiciousCount < SUSPICIOUS_MAX ? suspiciousCount : SUSPICIOUS_MAX;
-    // oldest → newest order
-    for (int i = 0; i < total; i++) {
-        int idx = (suspiciousHead - total + i + SUSPICIOUS_MAX * 2) % SUSPICIOUS_MAX;
-        JsonObject e = arr.createNestedObject();
-        e["user"] = suspiciousLog[idx].name;
-        e["time"] = suspiciousLog[idx].time;
-    }
-}
-
 // ───────── Admin state ─────────
-int adminMenuItem   = 0;
-int adminEditUser   = 0;
-int adminPwdUser    = 0;
-uint8_t newPwdBuffer[USER_PASSWORD_LEN] = {};
-uint8_t newPwdPos   = 0;
-#define ADMIN_MENU_COUNT 4
-uint32_t calibPulseStart = 0;   // pulse snapshot on entering calib screen
-static const uint16_t calibRefOptions[] = {10, 20, 50, 100, 200, 500, 1000};
-static const int calibRefCount = 7;
-int calibRefIdx = 3;            // default 100m
+int adminMenuItem  = 0;   // selected menu item
+int adminEditUser  = 0;   // user being edited in weight screen
+#define ADMIN_MENU_COUNT 2
 
 // ───────── State machine ─────────
-enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_USER_AUTH, SCR_GUEST_WEIGHT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
+enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
               SCR_UPLOADING, SCR_HISTORY,
               SCR_CALIB_AUTH, SCR_ADMIN_MENU, SCR_CALIB,
-              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT,
-              SCR_ADMIN_PASSWORDS, SCR_ADMIN_PASSWORD_EDIT,
-              SCR_ADMIN_STROKE_GAP };
+              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -427,7 +338,11 @@ unsigned long lastPulseMs = 0;
 unsigned long lastPulseIntervalMs = 0;
 
 #ifdef SENSOR_TYPE_LDR
-bool     ldrPulseActive = false;
+volatile bool          ldrPulseActive     = false;
+volatile unsigned long ldrPulseCount      = 0;
+volatile unsigned long ldrLastPulseUs     = 0;
+volatile unsigned long ldrPulseIntervalUs = 0;
+hw_timer_t*            ldrTimer           = nullptr;
 #endif
 
 #ifdef SENSOR_TYPE_HALL
@@ -443,8 +358,7 @@ volatile unsigned long blockerPulseIntervalUs = 0;
 #endif
 
 // ───────── Workout state ─────────
-bool     workoutActive  = false;
-bool     lastUploadOk   = false;
+volatile bool workoutActive = false;    // volatile: read by the LDR sampling ISR
 uint32_t totalPulses    = 0;
 float    totalMeters    = 0;
 float    totalCalories  = 0;
@@ -453,11 +367,22 @@ float    currentSpeed   = 0;
 float    strokeRate     = 0;
 unsigned long workoutStartMs   = 0;
 unsigned long workoutElapsedMs = 0;
-unsigned long lastStrokeBoundary  = 0;
-bool          inStroke            = false;
-float         smoothedIntervalMs  = 0;   // fast EMA for display / drive detection
-float         bgIntervalMs        = 0;   // slow EMA background
-bool          inDrive             = false;
+unsigned long lastStrokeBoundary = 0;   // time of last drive (pull) start, for SPM
+bool     inDrive = false;               // true during drive phase (flywheel accelerating)
+float    emaIntervalMs   = 0;           // smoothed pulse interval (ms); omega ~ 1/interval
+float    extremaInterval = 0;           // turning-point interval for stroke detection
+float    emaSpeed        = 0;           // smoothed boat speed (m/s)
+// SPM averaged over a trailing window of >= SPM_WINDOW_MS (tune here)
+#define  SPM_WINDOW_MS   10000
+#define  STROKE_TS_MAX   32
+unsigned long strokeTimes[STROKE_TS_MAX] = {};
+int      strokeTsHead  = 0;             // ring: next write index
+int      strokeTsCount = 0;             // ring: valid entries
+// Drag k_eff from recovery deceleration (observational only; NOT fed to distance)
+#define  FLYWHEEL_INERTIA 0.1f          // kg*m^2 (rough; only scales displayed k_eff)
+float    kEff = 0;                      // smoothed effective drag (kg*m^2)
+unsigned long recoveryStartMs = 0;
+float    recoveryStartInterval = 0;
 
 // History
 #define MAX_HISTORY 10
@@ -470,31 +395,6 @@ struct WorkoutRecord {
 };
 WorkoutRecord history[MAX_HISTORY];
 int historyCount = 0;
-
-void loadHistory() {
-    prefs.begin("wrower", true);
-    historyCount = prefs.getInt("hcnt", 0);
-    if (historyCount > MAX_HISTORY) historyCount = MAX_HISTORY;
-    for (int i = 0; i < historyCount; i++) {
-        char key[6]; snprintf(key, sizeof(key), "h%d", i);
-        prefs.getBytes(key, &history[i], sizeof(WorkoutRecord));
-    }
-    prefs.end();
-}
-void persistHistory() {
-    prefs.begin("wrower", false);
-    // If NVS is almost full (<15 free entries), drop oldest records until safe
-    while (historyCount > 1 && prefs.freeEntries() < 15) {
-        historyCount--;
-        Serial.printf("[NVS] almost full, trimmed to %d records\n", historyCount);
-    }
-    prefs.putInt("hcnt", historyCount);
-    for (int i = 0; i < historyCount; i++) {
-        char key[6]; snprintf(key, sizeof(key), "h%d", i);
-        prefs.putBytes(key, &history[i], sizeof(WorkoutRecord));
-    }
-    prefs.end();
-}
 
 // ───────── Buttons ─────────
 struct Button {
@@ -551,24 +451,39 @@ void setBacklight(uint8_t val) {
 // ───────── Sensor Reading ─────────
 
 #ifdef SENSOR_TYPE_LDR
-void readSensor() {
-    if (!workoutActive && currentScreen != SCR_CALIB) return;
-
+// LDR is sampled by a 1 kHz hardware-timer ISR so pulses are never lost while the
+// loop is busy (the periodic full-screen redraw blocks the loop for ~10-20 ms).
+// The ISR only touches the ADC while a workout is active — the one window in which
+// no flash/NVS writes happen — so analogRead() from the ISR is safe in this firmware.
+void IRAM_ATTR ldrSampleISR() {
+    if (!workoutActive) return;
     int val = analogRead(LDR_SIGNAL_PIN);
-
-    // Detect falling edge: light blocked → paddle passing
     if (!ldrPulseActive && val < (LDR_THRESHOLD - LDR_HYSTERESIS)) {
-        ldrPulseActive = true;
+        ldrPulseActive = true;                       // falling edge: paddle passing
+        unsigned long now = micros();
+        if (ldrLastPulseUs > 0) ldrPulseIntervalUs = now - ldrLastPulseUs;
+        ldrLastPulseUs = now;
+        ldrPulseCount++;
+    } else if (ldrPulseActive && val > (LDR_THRESHOLD + LDR_HYSTERESIS)) {
+        ldrPulseActive = false;                      // rising edge: light restored
+    }
+}
+
+void readSensor() {
+    if (!workoutActive) return;
+
+    noInterrupts();
+    unsigned long pc = ldrPulseCount;
+    unsigned long interval = ldrPulseIntervalUs;
+    interrupts();
+
+    if (pc > pulseCount) {
         unsigned long now = millis();
         if (lastPulseMs > 0) {
-            lastPulseIntervalMs = now - lastPulseMs;
+            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
         }
         lastPulseMs = now;
-        pulseCount++;
-    }
-    // Detect rising edge: light restored → paddle passed
-    else if (ldrPulseActive && val > (LDR_THRESHOLD + LDR_HYSTERESIS)) {
-        ldrPulseActive = false;
+        pulseCount = pc;
     }
 }
 
@@ -589,7 +504,7 @@ void IRAM_ATTR hallISR() {
 }
 
 void readSensor() {
-    if (!workoutActive && currentScreen != SCR_CALIB) return;
+    if (!workoutActive) return;
 
     noInterrupts();
     unsigned long pc = hallPulseCount;
@@ -623,7 +538,7 @@ void IRAM_ATTR blockerISR() {
 }
 
 void readSensor() {
-    if (!workoutActive && currentScreen != SCR_CALIB) return;
+    if (!workoutActive) return;
 
     noInterrupts();
     unsigned long pc = blockerPulseCount;
@@ -648,10 +563,6 @@ int getSensorThreshold() { return 0; }
 // ───────── BLE FTMS Setup & Update ─────────
 void initBLE() {
     BLEDevice::init("WaterRower-" MACHINE_SN);
-    // Max TX power for best range
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_ADV,     ESP_PWR_LVL_P9);
-    esp_ble_tx_power_set(ESP_BLE_PWR_TYPE_DEFAULT, ESP_PWR_LVL_P9);
-
     bleServer = BLEDevice::createServer();
     bleServer->setCallbacks(new FTMSCallbacks());
 
@@ -661,7 +572,10 @@ void initBLE() {
     // FTMS Feature (required) — declare rower support
     ftmsFeatureChar = ftmsService->createCharacteristic(
         FTMS_FEATURE_UUID, BLECharacteristic::PROPERTY_READ);
-    uint8_t ftmsFeatures[8] = {0x26, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    // Fitness Machine Features: Rower supported
+    // Byte 0-3: Machine Features, Byte 4-7: Target Setting Features
+    uint8_t ftmsFeatures[8] = {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00};
+    ftmsFeatures[0] = 0x26; // stroke rate, total distance, pace, calories
     ftmsFeatureChar->setValue(ftmsFeatures, 8);
 
     // Rower Data (notify)
@@ -672,18 +586,16 @@ void initBLE() {
 
     ftmsService->start();
 
-    // Advertise — include FTMS UUID so fitness apps discover the device
+    // Advertise
     BLEAdvertising* adv = BLEDevice::getAdvertising();
     adv->addServiceUUID(FTMS_SERVICE_UUID);
     adv->setScanResponse(true);
-    adv->setMinPreferred(0x06);   // connection interval hint (helps iOS)
-    adv->setMaxPreferred(0x12);
     BLEDevice::startAdvertising();
 }
 
 void updateBLE() {
     if (!bleClientConnected) return;
-    if (!workoutActive && currentScreen != SCR_CALIB) return;
+    if (!workoutActive) return;
     if (millis() - lastBleUpdate < BLE_UPDATE_INTERVAL_MS) return;
     lastBleUpdate = millis();
 
@@ -691,7 +603,7 @@ void updateBLE() {
     // Flags (2 bytes) + fields
     unsigned long elapsed = workoutElapsedMs + (millis() - workoutStartMs);
     uint16_t strokeRateX2 = (uint16_t)(strokeRate * 2);  // 0.5 resolution
-    uint16_t totalDist = (uint16_t)totalMeters;           // meters (wraps at 65535)
+    uint32_t totalDist = (uint32_t)totalMeters;           // FTMS total distance is uint24 (m)
     uint16_t paceS500 = 0;
     if (currentSpeed > 0.1f) {
         paceS500 = (uint16_t)(500.0f / currentSpeed);    // seconds per 500m
@@ -725,7 +637,7 @@ void updateBLE() {
     // Total distance (uint24, little endian)
     data[idx++] = totalDist & 0xFF;
     data[idx++] = (totalDist >> 8) & 0xFF;
-    data[idx++] = 0; // high byte
+    data[idx++] = (totalDist >> 16) & 0xFF;
     // Instantaneous pace (uint16, seconds per 500m)
     data[idx++] = paceS500 & 0xFF;
     data[idx++] = (paceS500 >> 8) & 0xFF;
@@ -777,13 +689,6 @@ void connectWiFi() {
         delay(500);
         tries++;
     }
-    // Wait for DHCP: IP must be assigned and non-zero
-    for (int i = 0; i < 20 && WiFi.localIP() == IPAddress(0,0,0,0); i++)
-        delay(200);
-    delay(500);  // let routing table settle
-    Serial.printf("[WIFI] IP=%s GW=%s\n",
-        WiFi.localIP().toString().c_str(),
-        WiFi.gatewayIP().toString().c_str());
 }
 
 // ───────── Timestamp ─────────
@@ -797,34 +702,12 @@ String getTimestamp() {
     return "1970-01-01T00:00:00Z";
 }
 
-// (GitHub upload removed — using TrueNAS NAS instead)
-// USERTrust ECC root cert kept in case GitHub upload is re-enabled later
-static const char* GITHUB_ROOT_CA =
-"-----BEGIN CERTIFICATE-----\n"
-"MIICjzCCAhWgAwIBAgIQXIuZxVqUxdJxVt7NiYDMJjAKBggqhkjOPQQDAzCBiDEL\n"
-"MAkGA1UEBhMCVVMxEzARBgNVBAgTCk5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNl\n"
-"eSBDaXR5MR4wHAYDVQQKExVUaGUgVVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMT\n"
-"JVVTRVJUcnVzdCBFQ0MgQ2VydGlmaWNhdGlvbiBBdXRob3JpdHkwHhcNMTAwMjAx\n"
-"MDAwMDAwWhcNMzgwMTE4MjM1OTU5WjCBiDELMAkGA1UEBhMCVVMxEzARBgNVBAgT\n"
-"Ck5ldyBKZXJzZXkxFDASBgNVBAcTC0plcnNleSBDaXR5MR4wHAYDVQQKExVUaGUg\n"
-"VVNFUlRSVVNUIE5ldHdvcmsxLjAsBgNVBAMTJVVTRVJUcnVzdCBFQ0MgQ2VydGlm\n"
-"aWNhdGlvbiBBdXRob3JpdHkwdjAQBgcqhkjOPQIBBgUrgQQAIgNiAAQarFRaqflo\n"
-"I+d61SRvU8Za2EurxtW20eZzca7dnNYMYf3boIkDuAUU7FfO7l0/4iGzzvfUinng\n"
-"o4N+LZfQYcTxmdwlkWOrfzCjtHDix6EznPO/LlxTsV+zfTJ/ijTjeXmjQjBAMB0G\n"
-"A1UdDgQWBBQ64QmG1M8ZwpZ2dEl23OA1xmNjmjAOBgNVHQ8BAf8EBAMCAQYwDwYD\n"
-"VR0TAQH/BAUwAwEB/zAKBggqhkjOPQQDAwNoADBlAjA2Z6EWCNzklwBBHU6+4WMB\n"
-"zzuqQhFkoJ2UOQIReVx7Hfpkue4WQrO/isIJxOzksU0CMQDpKmFHjFJKS04YcPbW\n"
-"RNZu9YO6bVi9JNlWSOrvxKJGgYhqOkbRqZtNyWHa0V1Xahg=\n"
-"-----END CERTIFICATE-----\n";
-
 // ───────── TrueNAS Upload (plain HTTP, local network) ─────────
 bool uploadToGitHub(uint32_t durSec) {
     connectWiFi();
     if (WiFi.status() != WL_CONNECTED) return false;
 
-    // Build workout JSON
-    static StaticJsonDocument<1024> doc;
-    doc.clear();
+    StaticJsonDocument<1024> doc;
     doc["machine_sn"]      = MACHINE_SN;
     doc["machine_model"]   = MACHINE_MODEL;
     doc["date"]            = getTimestamp();
@@ -844,7 +727,6 @@ bool uploadToGitHub(uint32_t durSec) {
     String content;
     serializeJsonPretty(doc, content);
 
-    // Build file path on NAS
     char filepath[128];
     struct tm ti;
     const char* uname = (currentUser < USER_COUNT) ? userNames[currentUser] : "Guest";
@@ -857,10 +739,8 @@ bool uploadToGitHub(uint32_t durSec) {
         snprintf(filepath, sizeof(filepath), "%s/%s_%lu.json", NAS_PATH, uname, millis());
     }
 
-    // Multipart form body for TrueNAS filesystem/put API
     String boundary = "WR32";
     String meta = String("{\"path\":\"") + filepath + "\"}";
-
     String body;
     body.reserve(content.length() + 256);
     body  = "--" + boundary + "\r\n";
@@ -872,7 +752,6 @@ bool uploadToGitHub(uint32_t durSec) {
     body += content + "\r\n";
     body += "--" + boundary + "--\r\n";
 
-    // Plain HTTP POST — no TLS, no BIGNUM issues
     WiFiClient wc;
     HTTPClient http;
     http.setTimeout(10000);
@@ -887,168 +766,20 @@ bool uploadToGitHub(uint32_t durSec) {
     return (code == 200);
 }
 
-// ───────── Bad Attempt Upload ─────────
-void uploadBadAttempt() {
-    connectWiFi();
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    static StaticJsonDocument<1024> doc;
-    doc.clear();
-    doc["machine_sn"]    = MACHINE_SN;
-    doc["machine_model"] = MACHINE_MODEL;
-    doc["event"]         = "bad_admin_attempt";
-    doc["attempts"]      = 3;
-    doc["timestamp"]     = getTimestamp();
-    JsonObject times = doc.createNestedObject("attempt_times");
-    for (int i = 0; i < 3; i++) {
-        char key[2] = {'1' + i, '\0'};
-        JsonObject entry = times.createNestedObject(key);
-        entry["time"] = pwdAttemptTimes[i];
-        char entered[CALIB_PASSWORD_LEN + 1];
-        for (int j = 0; j < CALIB_PASSWORD_LEN; j++)
-            entered[j] = '0' + pwdAttemptKeys[i][j];
-        entered[CALIB_PASSWORD_LEN] = '\0';
-        entry["entered"] = entered;
-    }
-    appendSuspiciousJson(doc);
-
-    String content;
-    serializeJsonPretty(doc, content);
-
-    size_t encodedLen = 0;
-    mbedtls_base64_encode(NULL, 0, &encodedLen,
-        (const unsigned char*)content.c_str(), content.length());
-    char* encoded = (char*)malloc(encodedLen + 1);
-    if (!encoded) return;
-    mbedtls_base64_encode((unsigned char*)encoded, encodedLen + 1, &encodedLen,
-        (const unsigned char*)content.c_str(), content.length());
-    encoded[encodedLen] = '\0';
-
-    struct tm _ti;
-    String filename;
-    if (getLocalTime(&_ti, 100)) {
-        char _pb[56];
-        snprintf(_pb, sizeof(_pb), "bad_attempt/%02d/%02d/%02d/%02d%02d%02d.json",
-            _ti.tm_mday, _ti.tm_mon + 1, _ti.tm_year % 100,
-            _ti.tm_hour, _ti.tm_min, _ti.tm_sec);
-        filename = String(_pb);
-    } else {
-        filename = "bad_attempt/" + String(MACHINE_SN) + "_unknown.json";
-    }
-
-    String url = "https://api.github.com/repos/";
-    url += GITHUB_OWNER; url += "/";
-    url += GITHUB_REPO;  url += "/contents/"; url += filename;
-
-    static StaticJsonDocument<1024> apiDoc;
-    apiDoc.clear();
-    apiDoc["message"] = "Security: 3 bad admin attempts " + getTimestamp();
-    apiDoc["content"] = encoded;
-    apiDoc["branch"]  = GITHUB_BRANCH;
-    String apiBody;
-    serializeJson(apiDoc, apiBody);
-    free(encoded);
-
-    WiFiClientSecure client;
-    client.setCACert(GITHUB_ROOT_CA);
-    HTTPClient http;
-    http.begin(client, url);
-    http.addHeader("Authorization", String("token ") + GITHUB_TOKEN);
-    http.addHeader("Accept", "application/vnd.github+json");
-    http.addHeader("Content-Type", "application/json");
-    http.PUT(apiBody);
-    http.end();
-}
-
-// ───────── User Bad Attempt Upload ─────────
-void uploadUserBadAttempt(int userIdx) {
-    connectWiFi();
-    if (WiFi.status() != WL_CONNECTED) return;
-
-    static StaticJsonDocument<1024> doc;
-    doc.clear();
-    doc["machine_sn"]    = MACHINE_SN;
-    doc["machine_model"] = MACHINE_MODEL;
-    doc["event"]         = "bad_user_attempt";
-    doc["user"]          = userNames[userIdx];
-    doc["attempts"]      = 3;
-    doc["timestamp"]     = getTimestamp();
-    JsonObject times = doc.createNestedObject("attempt_times");
-    for (int i = 0; i < 3; i++) {
-        char key[2] = {'1' + i, '\0'};
-        JsonObject entry = times.createNestedObject(key);
-        entry["time"] = userAttemptTimes[userIdx][i];
-        char entered[USER_PASSWORD_LEN + 1];
-        for (int j = 0; j < USER_PASSWORD_LEN; j++)
-            entered[j] = '0' + userAttemptKeys[userIdx][i][j];
-        entered[USER_PASSWORD_LEN] = '\0';
-        entry["entered"] = entered;
-    }
-    appendSuspiciousJson(doc);
-
-    String content;
-    serializeJsonPretty(doc, content);
-
-    size_t encodedLen = 0;
-    mbedtls_base64_encode(NULL, 0, &encodedLen,
-        (const unsigned char*)content.c_str(), content.length());
-    char* encoded = (char*)malloc(encodedLen + 1);
-    if (!encoded) return;
-    mbedtls_base64_encode((unsigned char*)encoded, encodedLen + 1, &encodedLen,
-        (const unsigned char*)content.c_str(), content.length());
-    encoded[encodedLen] = '\0';
-
-    struct tm _ti;
-    String filename;
-    if (getLocalTime(&_ti, 100)) {
-        char _pb[64];
-        snprintf(_pb, sizeof(_pb), "bad_attempt/%02d/%02d/%02d/%s_%02d%02d%02d.json",
-            _ti.tm_mday, _ti.tm_mon + 1, _ti.tm_year % 100,
-            userNames[userIdx],
-            _ti.tm_hour, _ti.tm_min, _ti.tm_sec);
-        filename = String(_pb);
-    } else {
-        filename = "bad_attempt/" + String(userNames[userIdx]) + "_unknown.json";
-    }
-
-    String url = "https://api.github.com/repos/";
-    url += GITHUB_OWNER; url += "/";
-    url += GITHUB_REPO;  url += "/contents/"; url += filename;
-
-    static StaticJsonDocument<1024> apiDoc;
-    apiDoc.clear();
-    apiDoc["message"] = "Security: 3 bad attempts for user " + String(userNames[userIdx]) + " " + getTimestamp();
-    apiDoc["content"] = encoded;
-    apiDoc["branch"]  = GITHUB_BRANCH;
-    String apiBody;
-    serializeJson(apiDoc, apiBody);
-    free(encoded);
-
-    WiFiClientSecure client;
-    client.setCACert(GITHUB_ROOT_CA);
-    HTTPClient http;
-    http.begin(client, url);
-    http.addHeader("Authorization", String("token ") + GITHUB_TOKEN);
-    http.addHeader("Accept", "application/vnd.github+json");
-    http.addHeader("Content-Type", "application/json");
-    http.PUT(apiBody);
-    http.end();
-}
-
 // ───────── Drawing Helpers ─────────
 void drawHeader(const char* title) {
     tft.fillRect(0, 0, TFT_WIDTH, 18, COL_HEADER_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
+    tft.setTextColor(COL_ACCENT);
     tft.setCursor(4, 5);
     tft.print(title);
     // BLE indicator
     tft.setCursor(TFT_WIDTH - 36, 5);
-    tft.setTextColor(COL_VALUE, COL_HEADER_BG);
-    tft.print(bleClientConnected ? "B+" : "b+");
+    tft.setTextColor(bleClientConnected ? COL_VALUE : COL_LABEL);
+    tft.print(bleClientConnected ? "BT" : "bt");
     // WiFi indicator
     tft.setCursor(TFT_WIDTH - 16, 5);
-    tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR, COL_HEADER_BG);
+    tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR);
     tft.print(WiFi.status() == WL_CONNECTED ? "W+" : "W-");
 }
 
@@ -1058,10 +789,10 @@ void drawDivider(int y) {
 
 void drawLabelValue(int x, int y, const char* label, const char* value, uint16_t valColor = COL_VALUE) {
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextColor(COL_LABEL);
     tft.setCursor(x, y);
     tft.print(label);
-    tft.setTextColor(valColor, COL_BG);
+    tft.setTextColor(valColor);
     tft.setCursor(x, y + 12);
     tft.setTextSize(2);
     tft.print(value);
@@ -1071,16 +802,16 @@ void drawKeyHints(const char* up, const char* down, const char* hash, const char
     int y = TFT_HEIGHT - 11;
     tft.fillRect(0, y - 2, TFT_WIDTH, 13, COL_HEADER_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_HEADER_BG);
-    if (up && up[0])   { tft.setCursor(2, y);   tft.printf("^%s", up); }
-    if (down && down[0]){ tft.setCursor(36, y);  tft.printf("v%s", down); }
+    tft.setTextColor(COL_LABEL);
+    if (up && up[0])   { tft.setCursor(2, y);   tft.printf("\x18%s", up); }
+    if (down && down[0]){ tft.setCursor(36, y);  tft.printf("\x19%s", down); }
     if (hash && hash[0]){ tft.setCursor(68, y);  tft.printf("#%s", hash); }
     if (star && star[0]){ tft.setCursor(100, y); tft.printf("*%s", star); }
 }
 
 // ───────── Screens ─────────
 void drawIdleScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("WATER ROWER");
 
     // Rowing person icon
@@ -1093,33 +824,32 @@ void drawIdleScreen() {
     tft.drawBitmap(108, 28, bmp_wave, 16, 16, BLUE);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextColor(COL_LABEL);
     tft.setCursor(30, 22);
     tft.print(MACHINE_SN);
 
     drawDivider(48);
 
-    // Sensor value — changes every redraw, clear line first
-    tft.fillRect(0, 51, TFT_WIDTH, 9, COL_BG);
+    // Sensor value
     int sensorVal = getSensorRaw();
     tft.setCursor(4, 52);
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextColor(COL_LABEL);
     tft.setTextSize(1);
     tft.printf("%s: %d", getSensorLabel(), sensorVal);
 
     tft.setCursor(4, 66);
-    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setTextColor(COL_ACCENT);
     tft.setTextSize(2);
     tft.print("READY");
 
-    // Idle message — changes every 3s, clear full line
-    tft.fillRect(0, 87, TFT_WIDTH, 9, COL_BG);
+    // Random funny idle message
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN, COL_BG);
+    tft.setTextColor(COL_WARN);
     tft.setCursor(4, 88);
     tft.print(idle_msgs[millis() / 3000 % NUM_IDLE_MSGS]);
 
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL);
     tft.setCursor(4, 108);
     tft.print("* START  # HISTORY");
 
@@ -1127,7 +857,7 @@ void drawIdleScreen() {
 }
 
 void drawWorkoutScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("ROWING");
 
     unsigned long elapsed = workoutElapsedMs + (millis() - workoutStartMs);
@@ -1135,25 +865,24 @@ void drawWorkoutScreen() {
     uint32_t mn = sec / 60;
     uint32_t s  = sec % 60;
 
-    // Animated rower icon — erase old position before drawing new
-    tft.fillRect(4, 21, 24, 16, COL_BG);
+    // Animated rower icon (alternates position)
     int rowerX = 4 + (millis() / 400 % 3) * 2;
     tft.drawBitmap(rowerX, 21, bmp_rower, 16, 16, COL_ACCENT);
 
     char timeBuf[16];
     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mn, s);
     tft.setTextSize(2);
-    tft.setTextColor(COL_TEXT, COL_BG);
+    tft.setTextColor(COL_TEXT);
     tft.setCursor(30, 24);
     tft.print(timeBuf);
 
     drawDivider(42);
 
-    // Distance — always clear fire area, draw fire only when fast
+    // Distance with fire icon when going fast
     char distBuf[16];
     snprintf(distBuf, sizeof(distBuf), "%5.0f", totalMeters);
     drawLabelValue(4, 46, "DISTANCE (m)", distBuf);
-    tft.fillRect(108, 46, 16, 16, COL_BG);
+
     if (currentSpeed > 2.5f) {
         tft.drawBitmap(108, 46, bmp_fire, 16, 16, ST77XX_RED);
     }
@@ -1169,26 +898,24 @@ void drawWorkoutScreen() {
     }
     drawLabelValue(4, 80, "/500m SPLIT", splitBuf, COL_ACCENT);
 
-    // Motivational message — clear full line before printing (variable length)
+    // Motivational message (changes every 10 seconds)
     drawDivider(103);
-    tft.fillRect(0, 105, TFT_WIDTH, 9, COL_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN, COL_BG);
+    tft.setTextColor(COL_WARN);
     tft.setCursor(4, 106);
     tft.print(fun_msgs[(sec / 10) % NUM_FUN_MSGS]);
 
     // SPM & CAL
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextColor(COL_LABEL);
     tft.setCursor(4, 118);  tft.print("SPM");
     tft.setCursor(68, 118); tft.print("CAL");
     tft.setTextSize(2);
-    tft.setTextColor(COL_VALUE, COL_BG);
+    tft.setTextColor(COL_VALUE);
     tft.setCursor(4, 130);  tft.printf("%-3.0f", strokeRate);
     tft.setCursor(68, 130); tft.printf("%.0f", totalCalories);
 
-    // Animated water — erase row then redraw at new offset
-    tft.fillRect(0, 148, TFT_WIDTH, 12, COL_BG);
+    // Animated water at bottom
     int waveOffset = (millis() / 300) % 16;
     for (int x = waveOffset - 16; x < 128; x += 16) {
         tft.drawBitmap(x, 148, bmp_wave, 16, 16, BLUE);
@@ -1198,7 +925,7 @@ void drawWorkoutScreen() {
 }
 
 void drawPausedScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("PAUSED");
 
     uint32_t sec = workoutElapsedMs / 1000;
@@ -1229,20 +956,21 @@ void drawPausedScreen() {
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 84);   tft.printf("Dist: %.0f m", totalMeters);
-    tft.setCursor(4, 98);   tft.printf("Strokes: %d", strokeCount);
-    tft.setCursor(4, 112);  tft.printf("Cal: %.0f", totalCalories);
+    tft.setCursor(4, 82);   tft.printf("Dist: %.0f m", totalMeters);
+    tft.setCursor(4, 94);   tft.printf("Strokes: %d", strokeCount);
+    tft.setCursor(4, 106);  tft.printf("Cal: %.0f", totalCalories);
+    tft.setCursor(4, 118);  tft.printf("Drag k: %.4f", kEff);
 
     // Motivational nudge
     tft.setTextColor(COL_ACCENT);
     tft.setCursor(4, 130);
-    tft.print("* = Back in there!");
+    tft.print("* = Get back in there!");
 
     drawKeyHints("", "", "SAVE", "GO!");
 }
 
 void drawSummaryScreen(bool uploadOk) {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("SUMMARY");
 
     // Trophy icon
@@ -1292,11 +1020,11 @@ void drawSummaryScreen(bool uploadOk) {
         tft.print("Upload FAILED");
     }
 
-    drawKeyHints("", "", "BACK", (!uploadOk && currentUser != USER_COUNT) ? "RETRY" : "");
+    drawKeyHints("", "", "BACK", "");
 }
 
 void drawHistoryScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("HISTORY");
 
     if (historyCount == 0) {
@@ -1339,7 +1067,7 @@ void drawHistoryScreen() {
 }
 
 void drawUploadingScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("SAVING...");
 
     // Animated dots loading effect
@@ -1352,9 +1080,9 @@ void drawUploadingScreen() {
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 85);
+    tft.setCursor(10, 85);
     tft.print("Sending to GitHub...");
-    tft.setCursor(4, 100);
+    tft.setCursor(10, 100);
     tft.print("Don't pull the plug!");
 
     // Wave animation at bottom
@@ -1364,21 +1092,20 @@ void drawUploadingScreen() {
 }
 
 void drawAdminMenuScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("ADMIN MENU");
 
     tft.drawBitmap(56, 20, bmp_trophy, 16, 16, COL_WARN);
 
-    const char* items[] = {"Calibration", "User Weights", "Passwords", "Stroke Gap"};
+    const char* items[] = {"Calibration", "User Weights"};
     for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
         int y = 44 + i * 22;
         if (i == adminMenuItem) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
+            tft.setTextColor(COL_ACCENT);
             tft.setCursor(6, y); tft.print("> ");
         } else {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_BG);
-            tft.setTextColor(COL_LABEL, COL_BG);
+            tft.setTextColor(COL_LABEL);
             tft.setCursor(6, y); tft.print("  ");
         }
         tft.setTextSize(1);
@@ -1388,7 +1115,7 @@ void drawAdminMenuScreen() {
 }
 
 void drawAdminWeightsScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("USER WEIGHTS");
 
     int total = USER_COUNT + 1;
@@ -1423,7 +1150,7 @@ void drawAdminWeightsScreen() {
 }
 
 void drawAdminWeightEditScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     bool isGuest = (adminEditUser == USER_COUNT);
     const char* name = isGuest ? "Guest" : userNames[adminEditUser];
 
@@ -1444,119 +1171,13 @@ void drawAdminWeightEditScreen() {
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL);
     tft.setCursor(4, 100);
-    tft.print("^ +1 kg    v -1 kg");
+    tft.print("\x18 +1 kg    \x19 -1 kg");
 
     drawKeyHints("+1", "-1", "BACK", "SAVE");
 }
 
-void drawAdminPasswordsScreen() {
-    // screen cleared by refreshDisplay() on transition
-    drawHeader("USER PASSWORDS");
-
-    for (int i = 0; i < USER_COUNT; i++) {
-        int y = 26 + i * 26;
-        if (i == adminPwdUser) {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 24, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT);
-        } else {
-            tft.setTextColor(COL_LABEL);
-        }
-        tft.setTextSize(1);
-        tft.setCursor(6, y);
-        tft.print(userNames[i]);
-        // Show password as dots
-        tft.setTextColor(i == adminPwdUser ? COL_VALUE : COL_DIVIDER);
-        tft.setCursor(TFT_WIDTH - 40, y);
-        for (int j = 0; j < USER_PASSWORD_LEN; j++) tft.print("*");
-    }
-    drawKeyHints("UP", "DN", "BACK", "EDIT");
-}
-
-void drawAdminPasswordEditScreen() {
-    // screen cleared by refreshDisplay() on transition
-    drawHeader("SET PASSWORD");
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT);
-    tft.setCursor(4, 24);
-    tft.print(userNames[adminPwdUser]);
-
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 38);
-    tft.print("Enter new password:");
-
-    static const char* keyLabels[] = {"0", "1", "2", "3"};
-    for (int i = 0; i < USER_PASSWORD_LEN; i++) {
-        tft.setTextSize(2);
-        if (i < (int)newPwdPos) {
-            tft.setTextColor(COL_VALUE);
-            tft.setCursor(16 + i * 26, 54);
-            tft.print(keyLabels[newPwdBuffer[i]]);
-        } else {
-            tft.setTextColor(COL_DIVIDER);
-            tft.setCursor(16 + i * 26, 54);
-            tft.print("-");
-        }
-    }
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 90);
-    tft.print("Current:");
-    if (userNoPassword(adminPwdUser)) {
-        tft.setTextColor(COL_WARN);
-        tft.setCursor(56, 90);
-        tft.print("NO PASS");
-    } else {
-        tft.setTextColor(COL_DIVIDER);
-        tft.setCursor(56, 90);
-        for (int j = 0; j < USER_PASSWORD_LEN; j++) tft.print("*");
-    }
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 108);
-    if (newPwdPos == 0)
-        tft.print("#=CLEAR  else:0-3");
-    else
-        tft.print("^=0  v=1  #=2  *=3");
-
-    drawKeyHints("0", "1", newPwdPos == 0 ? "CLR" : "2", "3");
-}
-
-void drawStrokeGapScreen() {
-    drawHeader("STROKE GAP");
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 24);
-    tft.print("Gap between strokes:");
-
-    tft.setTextSize(3);
-    tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.fillRect(0, 38, TFT_WIDTH, 28, COL_BG);
-    tft.setCursor(8, 40);
-    tft.printf("%4ums", (unsigned)strokeGapMs);
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 75);
-    tft.print("Step: 50ms  (200-3000)");
-
-    drawDivider(90);
-
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 95);
-    tft.print("Default:");
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(60, 95);
-    tft.printf("%ums", STROKE_GAP_MS);
-
-    drawKeyHints("+50", "-50", "BACK", "SAVE");
-}
-
 void drawCalibAuthScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("ADMIN ACCESS");
 
     tft.drawBitmap(56, 22, bmp_skull, 16, 16, COL_WARN);
@@ -1566,91 +1187,70 @@ void drawCalibAuthScreen() {
     tft.setCursor(4, 44);
     tft.print("Enter password:");
 
-    // Show entered keys as their digit (0/1/2/3) for entered, dash for remaining
-    static const char* keyLabels[] = {"0", "1", "2", "3"};
+    // Show entered dots
     for (int i = 0; i < CALIB_PASSWORD_LEN; i++) {
         tft.setTextSize(2);
-        if (i < (int)pwdPos) {
-            tft.setTextColor(COL_ACCENT);
-            tft.setCursor(16 + i * 26, 58);
-            tft.print(keyLabels[pwdBuffer[i]]);
-        } else {
-            tft.setTextColor(COL_DIVIDER);
-            tft.setCursor(16 + i * 26, 58);
-            tft.print("-");
-        }
+        tft.setTextColor(i < (int)pwdPos ? COL_ACCENT : COL_DIVIDER);
+        tft.setCursor(16 + i * 26, 58);
+        tft.print(i < (int)pwdPos ? "*" : "-");
     }
 
     if (pwdWrong) {
         tft.setTextSize(1);
         tft.setTextColor(COL_ERROR);
         tft.setCursor(4, 90);
-        tft.printf("WRONG! %d/3 attempts", pwdWrongCount);
+        tft.print("WRONG PASSWORD!");
     }
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL);
     tft.setCursor(4, 108);
-    tft.print("^=0  v=1  #=2  *=3");
+    tft.print("\x18=0  \x19=1  #=2  *=3");
 
     drawKeyHints("0", "1", "2", "3");
 }
 
 void drawCalibScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("CALIBRATION");
 
-    uint32_t counted = pulseCount - calibPulseStart;
-
-    // Live pulse counter — big and prominent
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setTextColor(COL_LABEL);
     tft.setCursor(4, 22);
-    tft.print("PULSES (pull rope):");
-    tft.setTextSize(3);
-    tft.setTextColor(counted > 0 ? COL_ACCENT : COL_DIVIDER, COL_BG);
-    tft.setCursor(4, 34);
-    tft.printf("%5lu", (unsigned long)counted);
+    tft.print("METERS / PULSE");
 
-    // Calculated m/pulse — clear the whole region first (content changes)
-    tft.fillRect(0, 63, TFT_WIDTH, 28, COL_BG);
     tft.setTextSize(1);
-    uint16_t refM = calibRefOptions[calibRefIdx];
-    if (counted > 0) {
-        tft.setTextColor(COL_WARN, COL_BG);
-        tft.setCursor(4, 65);
-        tft.printf("Ref %um / pulses:", (unsigned)refM);
-        tft.setTextColor(COL_VALUE, COL_BG);
-        tft.setCursor(4, 76);
-        tft.printf("%lu=%.8f", (unsigned long)counted, (float)refM / counted);
-    } else {
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setCursor(4, 68);
-        tft.printf("Pull rope (ref %um)", (unsigned)refM);
-    }
-
-    drawDivider(90);
-
-    // Current set value
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 95);
-    tft.print("SET m/pulse:");
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(4, 107);
+    tft.setTextColor(COL_VALUE);
+    tft.setCursor(4, 36);
     tft.printf("%.8f", calMetersPerPulse);
 
-    // Key hints
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 122);
-    tft.print("UP/DN=ref  #=RST  *=SAVE");
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 54);
+    tft.printf("= %.4f m/rev", calMetersPerPulse * PULSES_PER_REV);
 
-    drawKeyHints("ref+", "ref-", counted > 0 ? "RESET" : "BACK", "SAVE");
+    drawDivider(68);
+
+    tft.setTextColor(COL_LABEL);
+    tft.setCursor(4, 74);
+    tft.print("\x18 +0.000001");
+    tft.setCursor(4, 88);
+    tft.print("\x19 -0.000001");
+    tft.setCursor(4, 102);
+    tft.print("* SAVE & EXIT");
+    tft.setCursor(4, 116);
+    tft.print("# CANCEL");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_WARN);
+    tft.setCursor(4, 132);
+    tft.printf("Default: %.7f", (float)METERS_PER_PULSE);
+
+    drawKeyHints("+", "-", "BACK", "SAVE");
 }
 
 void drawUserSelectScreen() {
-    // screen cleared by refreshDisplay() on transition
+    tft.fillScreen(COL_BG);
     drawHeader("WHO ARE YOU?");
 
     // scroll up indicator
@@ -1658,7 +1258,7 @@ void drawUserSelectScreen() {
         tft.setTextColor(COL_LABEL);
         tft.setTextSize(1);
         tft.setCursor(60, 20);
-        tft.print("^");  // up
+        tft.print("\x1e");  // ▲
     }
 
     int totalUsers = USER_COUNT + 1;  // +1 for Guest
@@ -1671,12 +1271,11 @@ void drawUserSelectScreen() {
 
         if (i == currentUser) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT, COL_HEADER_BG);
+            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT);
             tft.setCursor(6, y);
             tft.print("> ");
         } else {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_BG);
-            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL, COL_BG);
+            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL);
             tft.setCursor(6, y);
             tft.print("  ");
         }
@@ -1685,7 +1284,7 @@ void drawUserSelectScreen() {
 
         // counter on right (Guest shows no number)
         if (!isGuest) {
-            tft.setTextColor(COL_DIVIDER, COL_BG);
+            tft.setTextColor(COL_DIVIDER);
             tft.setCursor(TFT_WIDTH - 20, y);
             tft.printf("%d/%d", i + 1, USER_COUNT);
         }
@@ -1696,82 +1295,10 @@ void drawUserSelectScreen() {
         tft.setTextColor(COL_LABEL);
         tft.setTextSize(1);
         tft.setCursor(60, 140);
-        tft.print("v");  // down
+        tft.print("\x1f");  // ▼
     }
 
     drawKeyHints("UP", "DN", "BACK", "GO");
-}
-
-void drawUserAuthScreen() {
-    // screen cleared by refreshDisplay() on transition
-    drawHeader("USER LOGIN");
-
-    tft.drawBitmap(56, 22, bmp_rower, 16, 16, COL_ACCENT);
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT);
-    tft.setCursor(4, 44);
-    tft.print(userNames[currentUser]);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 54);
-    tft.print("Enter password:");
-
-    static const char* keyLabels[] = {"0", "1", "2", "3"};
-    for (int i = 0; i < USER_PASSWORD_LEN; i++) {
-        tft.setTextSize(2);
-        if (i < (int)userPwdPos) {
-            tft.setTextColor(COL_ACCENT);
-            tft.setCursor(16 + i * 26, 58);
-            tft.print(keyLabels[userPwdBuffer[i]]);
-        } else {
-            tft.setTextColor(COL_DIVIDER);
-            tft.setCursor(16 + i * 26, 58);
-            tft.print("-");
-        }
-    }
-
-    if (userPwdWrong) {
-        tft.setTextSize(1);
-        tft.setTextColor(COL_ERROR);
-        tft.setCursor(4, 90);
-        tft.printf("WRONG! %d/3 attempts", userWrongCount[currentUser]);
-    }
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 108);
-    tft.print("^=0  v=1  #=2  *=3");
-
-    drawKeyHints("0", "1", "2", "3");
-}
-
-void drawGuestWeightScreen() {
-    // screen cleared by refreshDisplay() on transition
-    drawHeader("GUEST WEIGHT");
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT);
-    tft.setCursor(4, 24);
-    tft.print("Guest");
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 38);
-    tft.print("Weight (not saved):");
-
-    tft.setTextSize(3);
-    tft.setTextColor(COL_WARN);
-    tft.setCursor(20, 60);
-    tft.printf("%.0f", userWeights[USER_COUNT]);
-    tft.setTextSize(2);
-    tft.print(" kg");
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 110);
-    tft.print("^ +1 kg    v -1 kg");
-
-    drawKeyHints("+1", "-1", "BACK", "GO");
 }
 
 // ───────── Save to history ─────────
@@ -1785,7 +1312,6 @@ void saveToHistory(uint32_t durSec) {
     history[0].distance    = totalMeters;
     history[0].strokes     = strokeCount;
     history[0].calories    = totalCalories;
-    persistHistory();
 }
 
 // ───────── Reset ─────────
@@ -1793,12 +1319,15 @@ void resetWorkout() {
     totalPulses = 0; totalMeters = 0; totalCalories = 0;
     strokeCount = 0; currentSpeed = 0; strokeRate = 0;
     workoutElapsedMs = 0; lastPulseMs = 0;
-    lastStrokeBoundary = 0; inStroke = false;
-    smoothedIntervalMs = 0; bgIntervalMs = 0; inDrive = false;
+    lastStrokeBoundary = 0; inDrive = false;
+    emaIntervalMs = 0; extremaInterval = 0; emaSpeed = 0;
+    strokeTsHead = 0; strokeTsCount = 0;
+    kEff = 0; recoveryStartMs = 0; recoveryStartInterval = 0;
     pulseCount = 0; displayPage = 0;
     lastPulseIntervalMs = 0;
 #ifdef SENSOR_TYPE_LDR
     ldrPulseActive = false;
+    ldrPulseCount = 0; ldrLastPulseUs = 0; ldrPulseIntervalUs = 0;
 #endif
 #ifdef SENSOR_TYPE_HALL
     hallPulseCount = 0;
@@ -1808,96 +1337,144 @@ void resetWorkout() {
 #endif
 }
 
+// ───────── SPM over a trailing window (>= SPM_WINDOW_MS) ─────────
+// Walk back through recorded stroke times until the span covers the window
+// (or the ring is exhausted); rate = intervals / span. Averages >= 10 s.
+float computeSpm() {
+    if (strokeTsCount < 2) return strokeRate;   // need >= 2 strokes for an interval
+    int newest = (strokeTsHead - 1 + STROKE_TS_MAX) % STROKE_TS_MAX;
+    unsigned long tNew = strokeTimes[newest];
+    unsigned long tOld = tNew;
+    int n = 1;
+    for (int k = 1; k < strokeTsCount; k++) {
+        int j = (newest - k + STROKE_TS_MAX) % STROKE_TS_MAX;
+        tOld = strokeTimes[j];
+        n++;
+        if (tNew - tOld >= SPM_WINDOW_MS) break;   // window covered
+    }
+    if (tNew <= tOld) return strokeRate;
+    return (float)(n - 1) * 60000.0f / (float)(tNew - tOld);
+}
+
 // ───────── Process sensor data ─────────
 void processSensor() {
-    if (!workoutActive && currentScreen != SCR_CALIB) return;
+    if (!workoutActive) return;
 
     if (pulseCount > totalPulses) {
         uint32_t newPulses = pulseCount - totalPulses;
         totalPulses = pulseCount;
         totalMeters += newPulses * calMetersPerPulse;
-        // calories: weight-based estimate (0.571 kcal per kg per km)
+        // calories: weight-based estimate (~0.571 kcal per kg per km)
         totalCalories = totalMeters * userWeights[currentUser] * 0.000571f;
 
-        // Speed from last pulse interval
+        unsigned long now = millis();
+
+        // Smooth the single-pulse interval (raw value is very noisy)
         if (lastPulseIntervalMs > 0) {
-            currentSpeed = calMetersPerPulse / (lastPulseIntervalMs / 1000.0f);
+            float iv = (float)lastPulseIntervalMs;
+            emaIntervalMs = (emaIntervalMs > 0) ? (0.6f * emaIntervalMs + 0.4f * iv) : iv;
+
+            // Boat speed from smoothed angular velocity (omega ~ 1/interval), then smooth again
+            float spd = calMetersPerPulse / (emaIntervalMs / 1000.0f);
+            emaSpeed = (emaSpeed > 0) ? (0.7f * emaSpeed + 0.3f * spd) : spd;
+            currentSpeed = emaSpeed;
         }
 
-        // Stroke detection: dual-EMA speed comparison.
-        // fastEma (α=0.25) tracks instantaneous speed.
-        // bgEma   (α=0.01) tracks background average (very slow, ~1-2s time constant).
-        // Drive = fastEma significantly faster than background → new stroke start.
-        if (lastPulseIntervalMs > 0) {
-            if (smoothedIntervalMs == 0) { smoothedIntervalMs = bgIntervalMs = lastPulseIntervalMs; }
-            smoothedIntervalMs = smoothedIntervalMs * 0.75f + lastPulseIntervalMs * 0.25f;
-            bgIntervalMs       = bgIntervalMs       * 0.99f + lastPulseIntervalMs * 0.01f;
+        // ── Stroke detection by flywheel accel/decel (peak/valley of omega) ──
+        //   interval shrinking -> flywheel speeding up -> DRIVE (pull)
+        //   interval growing   -> flywheel coasting    -> RECOVERY
+        // A new stroke = recovery->drive reversal (interval turns from rising to falling).
+        if (emaIntervalMs > 0) {
+            if (!inDrive) {
+                // recovery: track the max interval; a drop past hysteresis = drive start
+                if (emaIntervalMs > extremaInterval) extremaInterval = emaIntervalMs;
+                if (extremaInterval > 0 &&
+                    emaIntervalMs < extremaInterval * (1.0f - STROKE_HYST) &&
+                    (now - lastStrokeBoundary > STROKE_MIN_MS)) {
+                    inDrive = true;
 
-            // Drive: fast EMA < 72% of background = flywheel 28%+ faster than average
-            bool driving = (bgIntervalMs > 0 && smoothedIntervalMs < bgIntervalMs * 0.72f);
-            if (!inDrive && driving) {
-                unsigned long now = millis();
-                if (lastStrokeBoundary == 0 || now - lastStrokeBoundary > (unsigned long)strokeGapMs) {
-                    if (lastStrokeBoundary > 0)
-                        strokeRate = 60000.0f / (now - lastStrokeBoundary);
+                    // estimate drag k_eff from the recovery that just ended:
+                    // during recovery 1/omega (proportional to interval) grows ~linearly,
+                    // slope = k/I  ->  k = I * (N/2pi) * d(interval_s)/dt_s
+                    if (recoveryStartMs > 0) {
+                        float dt_s  = (now - recoveryStartMs) / 1000.0f;
+                        float dIv_s = (extremaInterval - recoveryStartInterval) / 1000.0f;
+                        if (dt_s > 0.2f && dIv_s > 0.0f) {
+                            float kInst = FLYWHEEL_INERTIA * (PULSES_PER_REV / 6.2831853f)
+                                          * (dIv_s / dt_s);
+                            kEff = (kEff > 0) ? (0.7f * kEff + 0.3f * kInst) : kInst;
+                        }
+                    }
+
                     lastStrokeBoundary = now;
                     strokeCount++;
+                    extremaInterval = emaIntervalMs;   // now track the min during drive
+
+                    // record stroke time; SPM = average over >= SPM_WINDOW_MS
+                    strokeTimes[strokeTsHead] = now;
+                    strokeTsHead = (strokeTsHead + 1) % STROKE_TS_MAX;
+                    if (strokeTsCount < STROKE_TS_MAX) strokeTsCount++;
+                    strokeRate = computeSpm();
+                }
+            } else {
+                // drive: track the min interval; a rise past hysteresis = recovery start
+                if (emaIntervalMs < extremaInterval || extremaInterval == 0) extremaInterval = emaIntervalMs;
+                if (emaIntervalMs > extremaInterval * (1.0f + STROKE_HYST)) {
+                    inDrive = false;
+                    recoveryStartMs = now;
+                    recoveryStartInterval = emaIntervalMs;
+                    extremaInterval = emaIntervalMs;   // now track the max during recovery
                 }
             }
-            inDrive = driving;
         }
     }
 
-    // Idle detection
+    // Idle detection: no pulses for a while -> stop dynamics (distance & count are kept)
     if (lastPulseMs > 0 && (millis() - lastPulseMs > IDLE_TIMEOUT_MS)) {
         currentSpeed = 0;
         strokeRate = 0;
+        emaSpeed = 0;
+        emaIntervalMs = 0;
+        extremaInterval = 0;
+        inDrive = false;
+        lastStrokeBoundary = 0;   // next stroke after idle won't compute a bogus SPM
+        strokeTsHead = 0; strokeTsCount = 0;
+        recoveryStartMs = 0;      // don't measure drag across a pause
     }
 }
 
 // ───────── Handle input ─────────
 void handleInput() {
     switch (currentScreen) {
-    case SCR_IDLE: {
-        // Capture all presses first, then decide action
-        bool up   = consume(btnUp);
-        bool down = consume(btnDown);
-        bool hash = consume(btnHash);
-        bool star = consume(btnStar);
-
-        // Push every press into combo sliding window
-        if (up)   { pushCombo(0); brightness = min(255, brightness + 25); setBacklight(brightness); }
-        if (down) { pushCombo(1); brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); }
-        if (hash)   pushCombo(2);
-        if (star)   pushCombo(3);
-
-        // Combo check runs after EVERY key — works regardless of which key ends the combo
-        if (checkCombo()) {
-            memset(comboBuffer, 0, sizeof(comboBuffer));
-            comboPos = 0;
-            if (millis() < pwdLockUntilMs) {
-                playTone(150, 400);
-            } else {
+    case SCR_IDLE:
+        if (consume(btnUp))   { pushCombo(0); brightness = min(255, brightness + 25); setBacklight(brightness); }
+        if (consume(btnDown)) { pushCombo(1); brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); }
+        if (consume(btnHash)) { pushCombo(2); beep(); displayPage = 0; currentScreen = SCR_HISTORY; }
+        if (consume(btnStar)) {
+            pushCombo(3);
+            if (checkCombo()) {
+                // Secret combo entered → go to admin auth
+                memset(comboBuffer, 0, sizeof(comboBuffer));
+                comboPos = 0;
                 pwdPos = 0; pwdWrong = false;
                 beep(); delay(80); beep();
+#if CALIB_REQUIRE_PASSWORD
                 currentScreen = SCR_CALIB_AUTH;
+#else
+                adminMenuItem = 0;
+                currentScreen = SCR_ADMIN_MENU;   // no password: combo opens admin directly
+#endif
+            } else {
+                beep();
+                currentUser = 0;
+                userScrollOffset = 0;
+                currentScreen = SCR_USER_SELECT;
             }
-            break;
         }
-
-        // Normal navigation only if combo didn't fire
-        if (hash) { beep(); displayPage = 0; currentScreen = SCR_HISTORY; }
-        if (star) { beep(); currentUser = 0; userScrollOffset = 0; currentScreen = SCR_USER_SELECT; }
         break;
-    }
 
     case SCR_CALIB_AUTH:
-        {
-            if (millis() < pwdLockUntilMs) {
-                consume(btnUp); consume(btnDown); consume(btnHash); consume(btnStar);
-                currentScreen = SCR_IDLE;
-                break;
-            }
+        { // password entry — each button appends a digit
             uint8_t pressed = 0xFF;
             if (consume(btnUp))   pressed = 0;
             if (consume(btnDown)) pressed = 1;
@@ -1912,28 +1489,13 @@ void handleInput() {
                     for (int i = 0; i < CALIB_PASSWORD_LEN; i++)
                         if (pwdBuffer[i] != calibPassword[i]) { ok = false; break; }
                     if (ok) {
-                        pwdWrongCount = 0;
                         playTone(1600, 100);
                         adminMenuItem = 0;
                         currentScreen = SCR_ADMIN_MENU;
                     } else {
-                        if (pwdWrongCount < 3) {
-                            String ts = getTimestamp();
-                            strncpy(pwdAttemptTimes[pwdWrongCount], ts.c_str(), 31);
-                            memcpy(pwdAttemptKeys[pwdWrongCount], pwdBuffer, CALIB_PASSWORD_LEN);
-                        }
-                        pwdWrongCount++;
                         pwdWrong = true;
                         pwdPos = 0;
-                        if (pwdWrongCount >= 3) {
-                            pwdLockUntilMs = millis() + 300000UL;  // 5 min
-                            pwdWrongCount = 0;
-                            addSuspicious("ADMIN");
-                            playTone(150, 600);
-                            uploadBadAttempt();
-                        } else {
-                            playTone(200, 300);
-                        }
+                        playTone(200, 300);
                     }
                 }
             }
@@ -1946,40 +1508,25 @@ void handleInput() {
         if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
         if (consume(btnStar)) {
             beep();
-            if (adminMenuItem == 0) {
-                readSensor();               // sync pulseCount from ISR before snapshotting
-                calibPulseStart = pulseCount;
-                currentScreen = SCR_CALIB;
-            }
+            if (adminMenuItem == 0) currentScreen = SCR_CALIB;
             else if (adminMenuItem == 1) { adminEditUser = 0; currentScreen = SCR_ADMIN_WEIGHTS; }
-            else if (adminMenuItem == 2) { adminPwdUser = 0; currentScreen = SCR_ADMIN_PASSWORDS; }
-            else if (adminMenuItem == 3) { currentScreen = SCR_ADMIN_STROKE_GAP; }
         }
         break;
 
-    case SCR_CALIB: {
-        uint32_t counted = pulseCount - calibPulseStart;
-        if (consume(btnUp))   { if (calibRefIdx < calibRefCount - 1) calibRefIdx++; beep(); }
-        if (consume(btnDown)) { if (calibRefIdx > 0) calibRefIdx--; beep(); }
+    case SCR_CALIB:
+        if (consume(btnUp))   { calMetersPerPulse += 0.000001f; }
+        if (consume(btnDown)) { if (calMetersPerPulse > 0.000001f) calMetersPerPulse -= 0.000001f; }
         if (consume(btnStar)) {
-            if (counted > 0)
-                calMetersPerPulse = (float)calibRefOptions[calibRefIdx] / counted;
             saveCalibration();
             playTone(TONE_UPLOAD, 200);
             currentScreen = SCR_ADMIN_MENU;
         }
         if (consume(btnHash)) {
-            if (counted > 0) {
-                calibPulseStart = pulseCount;  // reset counter
-                beep();
-            } else {
-                loadCalibration();
-                beep();
-                currentScreen = SCR_ADMIN_MENU;
-            }
+            loadCalibration();
+            beep();
+            currentScreen = SCR_ADMIN_MENU;
         }
         break;
-    }
 
     case SCR_ADMIN_WEIGHTS:
         if (consume(btnUp))   { if (adminEditUser > 0) adminEditUser--; }
@@ -2003,53 +1550,6 @@ void handleInput() {
         }
         break;
 
-    case SCR_ADMIN_PASSWORDS:
-        if (consume(btnUp))   { if (adminPwdUser > 0) adminPwdUser--; }
-        if (consume(btnDown)) { if (adminPwdUser < USER_COUNT - 1) adminPwdUser++; }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_ADMIN_MENU; }
-        if (consume(btnStar)) {
-            beep();
-            newPwdPos = 0;
-            memset(newPwdBuffer, 0, sizeof(newPwdBuffer));
-            currentScreen = SCR_ADMIN_PASSWORD_EDIT;
-        }
-        break;
-
-    case SCR_ADMIN_PASSWORD_EDIT:
-        {
-            // # before any digit = clear password (no password required)
-            if (newPwdPos == 0 && consume(btnHash)) {
-                memset(userPasswords[adminPwdUser], 0xFF, USER_PASSWORD_LEN);
-                savePassword(adminPwdUser);
-                playTone(TONE_UPLOAD, 200);
-                currentScreen = SCR_ADMIN_PASSWORDS;
-                break;
-            }
-            uint8_t pressed = 0xFF;
-            if (consume(btnUp))   pressed = 0;
-            if (consume(btnDown)) pressed = 1;
-            if (consume(btnHash)) pressed = 2;
-            if (consume(btnStar)) pressed = 3;
-            if (pressed != 0xFF) {
-                beep();
-                newPwdBuffer[newPwdPos++] = pressed;
-                if (newPwdPos >= USER_PASSWORD_LEN) {
-                    memcpy(userPasswords[adminPwdUser], newPwdBuffer, USER_PASSWORD_LEN);
-                    savePassword(adminPwdUser);
-                    playTone(TONE_UPLOAD, 200);
-                    currentScreen = SCR_ADMIN_PASSWORDS;
-                }
-            }
-        }
-        break;
-
-    case SCR_ADMIN_STROKE_GAP:
-        if (consume(btnUp))   { strokeGapMs = min((uint16_t)3000, (uint16_t)(strokeGapMs + 50)); beep(); }
-        if (consume(btnDown)) { strokeGapMs = max((uint16_t)200,  (uint16_t)(strokeGapMs - 50)); beep(); }
-        if (consume(btnStar)) { saveCalibration(); playTone(TONE_UPLOAD, 200); currentScreen = SCR_ADMIN_MENU; }
-        if (consume(btnHash)) { loadCalibration(); beep(); currentScreen = SCR_ADMIN_MENU; }
-        break;
-
     case SCR_USER_SELECT:
         if (consume(btnUp)) {
             if (currentUser > 0) {
@@ -2068,85 +1568,6 @@ void handleInput() {
         if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
         if (consume(btnStar)) {
             beep();
-            if (currentUser == USER_COUNT) {
-                userWeights[USER_COUNT] = DEFAULT_WEIGHT_KG;
-                currentScreen = SCR_GUEST_WEIGHT;
-            } else if (millis() < userLockUntilMs[currentUser]) {
-                playTone(150, 400);
-                currentScreen = SCR_IDLE;
-            } else if (userNoPassword(currentUser)) {
-                resetWorkout();
-                workoutActive = true;
-                workoutStartMs = millis();
-                currentScreen = SCR_WORKOUT;
-                playTone(TONE_START, TONE_DURATION);
-            } else {
-                userPwdPos = 0;
-                userPwdWrong = false;
-                memset(userPwdBuffer, 0, sizeof(userPwdBuffer));
-                currentScreen = SCR_USER_AUTH;
-            }
-        }
-        break;
-
-    case SCR_USER_AUTH:
-        {
-            if (millis() < userLockUntilMs[currentUser]) {
-                consume(btnUp); consume(btnDown); consume(btnHash); consume(btnStar);
-                currentScreen = SCR_IDLE;
-                break;
-            }
-            uint8_t pressed = 0xFF;
-            if (consume(btnUp))   pressed = 0;
-            if (consume(btnDown)) pressed = 1;
-            if (consume(btnHash)) { beep(); currentScreen = SCR_USER_SELECT; break; }
-            if (consume(btnStar)) pressed = 3;
-            if (pressed != 0xFF) {
-                beep();
-                userPwdWrong = false;
-                userPwdBuffer[userPwdPos++] = pressed;
-                if (userPwdPos >= USER_PASSWORD_LEN) {
-                    bool ok = true;
-                    for (int i = 0; i < USER_PASSWORD_LEN; i++)
-                        if (userPwdBuffer[i] != userPasswords[currentUser][i]) { ok = false; break; }
-                    if (ok) {
-                        userWrongCount[currentUser] = 0;
-                        resetWorkout();
-                        workoutActive = true;
-                        workoutStartMs = millis();
-                        currentScreen = SCR_WORKOUT;
-                        playTone(TONE_START, TONE_DURATION);
-                    } else {
-                        int idx = userWrongCount[currentUser];
-                        if (idx < 3) {
-                            String ts = getTimestamp();
-                            strncpy(userAttemptTimes[currentUser][idx], ts.c_str(), 31);
-                            memcpy(userAttemptKeys[currentUser][idx], userPwdBuffer, USER_PASSWORD_LEN);
-                        }
-                        userWrongCount[currentUser]++;
-                        userPwdWrong = true;
-                        userPwdPos = 0;
-                        if (userWrongCount[currentUser] >= 3) {
-                            userLockUntilMs[currentUser] = millis() + 300000UL;
-                            userWrongCount[currentUser] = 0;
-                            addSuspicious(userNames[currentUser]);
-                            playTone(150, 600);
-                            uploadUserBadAttempt(currentUser);
-                            currentScreen = SCR_IDLE;
-                        } else {
-                            playTone(200, 300);
-                        }
-                    }
-                }
-            }
-        }
-        break;
-
-    case SCR_GUEST_WEIGHT:
-        if (consume(btnUp))   { userWeights[USER_COUNT] = min(200.0f, userWeights[USER_COUNT] + 1.0f); }
-        if (consume(btnDown)) { userWeights[USER_COUNT] = max(20.0f,  userWeights[USER_COUNT] - 1.0f); }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_USER_SELECT; }
-        if (consume(btnStar)) {
             resetWorkout();
             workoutActive = true;
             workoutStartMs = millis();
@@ -2183,10 +1604,6 @@ void handleInput() {
             beep();
             currentScreen = SCR_IDLE;
         }
-        if (!lastUploadOk && currentUser != USER_COUNT && consume(btnStar)) {
-            tft.fillScreen(COL_BG);
-            currentScreen = SCR_UPLOADING;  // retry
-        }
         break;
 
     case SCR_HISTORY:
@@ -2201,41 +1618,32 @@ void handleInput() {
 
 // ───────── Display refresh ─────────
 unsigned long lastRedraw = 0;
-#define REDRAW_MS 1000
+#define REDRAW_MS 250
 Screen lastDrawnScreen = (Screen)-1;
 
 void refreshDisplay() {
-    bool screenChanged = (currentScreen != lastDrawnScreen);
-    if (!screenChanged && millis() - lastRedraw < REDRAW_MS) return;
+    bool needsRedraw = (currentScreen != lastDrawnScreen);
+    if (!needsRedraw && millis() - lastRedraw < REDRAW_MS) return;
     lastRedraw = millis();
-    if (screenChanged) {
-        tft.fillScreen(COL_BG);
-        lastDrawnScreen = currentScreen;
-    }
+    lastDrawnScreen = currentScreen;
 
     switch (currentScreen) {
         case SCR_IDLE:        drawIdleScreen(); break;
-        case SCR_USER_SELECT:  drawUserSelectScreen(); break;
-        case SCR_USER_AUTH:    drawUserAuthScreen(); break;
-        case SCR_GUEST_WEIGHT: drawGuestWeightScreen(); break;
-        case SCR_WORKOUT:      drawWorkoutScreen(); break;
+        case SCR_USER_SELECT: drawUserSelectScreen(); break;
+        case SCR_WORKOUT:     drawWorkoutScreen(); break;
         case SCR_PAUSED:      drawPausedScreen(); break;
         case SCR_HISTORY:     drawHistoryScreen(); break;
         case SCR_CALIB_AUTH:        drawCalibAuthScreen(); break;
         case SCR_ADMIN_MENU:        drawAdminMenuScreen(); break;
         case SCR_CALIB:             drawCalibScreen(); break;
-        case SCR_ADMIN_WEIGHTS:         drawAdminWeightsScreen(); break;
-        case SCR_ADMIN_WEIGHT_EDIT:     drawAdminWeightEditScreen(); break;
-        case SCR_ADMIN_PASSWORDS:       drawAdminPasswordsScreen(); break;
-        case SCR_ADMIN_PASSWORD_EDIT:   drawAdminPasswordEditScreen(); break;
-        case SCR_ADMIN_STROKE_GAP:      drawStrokeGapScreen(); break;
+        case SCR_ADMIN_WEIGHTS:     drawAdminWeightsScreen(); break;
+        case SCR_ADMIN_WEIGHT_EDIT: drawAdminWeightEditScreen(); break;
         default: break;
     }
 }
 
 // ───────── Setup ─────────
 void setup() {
-    WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);  // disable brownout reset
     Serial.begin(115200);
 
     // Backlight (LEDC channel 0)
@@ -2256,6 +1664,7 @@ void setup() {
     tft.setTextWrap(false);
 
     // Splash with animation
+    tft.fillScreen(COL_BG);
 
     // Animated waves filling up
     for (int y = 150; y >= 90; y -= 4) {
@@ -2296,6 +1705,11 @@ void setup() {
 #ifdef SENSOR_TYPE_LDR
     pinMode(LDR_SIGNAL_PIN, INPUT);
     analogSetAttenuation(ADC_11db);  // full 0-3.3V range
+    // 1 kHz timer-driven sampling (immune to loop/redraw stalls); see ldrSampleISR
+    ldrTimer = timerBegin(0, 80, true);              // 80 MHz / 80 = 1 MHz tick
+    timerAttachInterrupt(ldrTimer, &ldrSampleISR, true);
+    timerAlarmWrite(ldrTimer, 1000, true);           // 1000 us -> 1 kHz
+    timerAlarmEnable(ldrTimer);
 #endif
 #ifdef SENSOR_TYPE_HALL
     pinMode(HALL_SENSOR_PIN, INPUT_PULLUP);
@@ -2313,10 +1727,8 @@ void setup() {
     pinMode(BTN_HASH_PIN, INPUT_PULLUP);
     pinMode(BTN_STAR_PIN, INPUT_PULLUP);
 
-    // Load saved calibration and passwords from NVS
+    // Load saved calibration from NVS
     loadCalibration();
-    loadPasswords();
-    loadHistory();
 
     // BLE FTMS
     initBLE();
@@ -2346,31 +1758,6 @@ void loop() {
 
     processSensor();
 
-    // Serial sensor debug — prints every 500ms
-    static unsigned long lastDbg = 0;
-    if (millis() - lastDbg >= 500) {
-        lastDbg = millis();
-#ifdef SENSOR_TYPE_BLOCKER
-        noInterrupts();
-        unsigned long isr = blockerPulseCount;
-        interrupts();
-        Serial.printf("[SENSOR] pin=%d ISR=%lu pulse=%lu strokes=%lu spm=%.1f fast=%.1f bg=%.1f drive=%d scr=%d\n",
-            BLOCKER_SENSOR_PIN, isr, (unsigned long)pulseCount, (unsigned long)strokeCount,
-            strokeRate, smoothedIntervalMs, bgIntervalMs, (int)inDrive, (int)currentScreen);
-#elif defined(SENSOR_TYPE_HALL)
-        noInterrupts();
-        unsigned long isr = hallPulseCount;
-        interrupts();
-        Serial.printf("[SENSOR] pin=%d raw=%d ISR_count=%lu pulseCount=%lu screen=%d\n",
-            HALL_SENSOR_PIN, digitalRead(HALL_SENSOR_PIN),
-            isr, (unsigned long)pulseCount, (int)currentScreen);
-#elif defined(SENSOR_TYPE_LDR)
-        Serial.printf("[SENSOR] analog=%d threshold=%d pulseCount=%lu screen=%d\n",
-            analogRead(LDR_SIGNAL_PIN), LDR_THRESHOLD,
-            (unsigned long)pulseCount, (int)currentScreen);
-#endif
-    }
-
     // BLE broadcast
     updateBLE();
 
@@ -2383,7 +1770,6 @@ void loop() {
             // Guest: screen + BLE only, no GitHub
             beep();
         } else {
-            tft.fillScreen(COL_BG);
             drawUploadingScreen();
             ok = uploadToGitHub(durSec);
             if (ok) {
@@ -2392,8 +1778,6 @@ void loop() {
                 playTone(300, 500);
             }
         }
-        lastUploadOk = ok;
-        tft.fillScreen(COL_BG);
         drawSummaryScreen(ok);
         currentScreen = SCR_SUMMARY;
         lastDrawnScreen = SCR_SUMMARY;

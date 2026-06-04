@@ -89,9 +89,30 @@
 #define TONE_UPLOAD   2000   // Hz
 #define TONE_DURATION 150    // ms
 
+// ===== Admin / Calibration access =====
+// A secret button combo on the IDLE screen opens admin mode.
+// Buttons: 0=UP(K1)  1=DOWN(K2)  2=#(K3)  3=*(K4).
+// The combo MUST end with 3 (*), the key that triggers the check.
+#define CALIB_COMBO            {0,1,0,1,2,3}
+#define CALIB_COMBO_LEN        6
+// Password AFTER the combo. Default: NO password — the combo alone opens admin.
+// Set CALIB_REQUIRE_PASSWORD to 1 to require the password below.
+#define CALIB_REQUIRE_PASSWORD 0
+#define CALIB_PASSWORD         {3,2,1,0}
+#define CALIB_PASSWORD_LEN     4
+
 // ===== Calibration =====
-#define PULSES_PER_REV      60                  // 60 teeth, 1 pulse per tooth
-#define METERS_PER_PULSE    (0.00875f / 60)     // ~0.0001458m per pulse
-#define STROKE_GAP_MS       500
-#define CAL_PER_METER       0.04f
+#define PULSES_PER_REV      60                  // 60 teeth -> 60 pulses per paddle revolution
+
+// Distance model (water-resistance rower): ~constant meters per revolution.
+// METERS_PER_REV is the calibration TARGET. Default ~1.4 m/rev is a physics estimate
+// for this machine (tank D~0.5m, ~17kg water, paddle ~2-4 rev/s). CALIBRATE on the real
+// machine:  new METERS_PER_REV = current METERS_PER_REV * (actual distance / shown distance)
+#define METERS_PER_REV      1.4f
+#define METERS_PER_PULSE    (METERS_PER_REV / PULSES_PER_REV)   // ~0.0233 m per pulse
+
+// Stroke detection (acceleration-based; see processSensor)
+#define STROKE_MIN_MS       600                 // min ms between strokes (~100 SPM ceiling)
+#define STROKE_HYST         0.06f               // fractional interval reversal to flip drive/recovery
+
 #define IDLE_TIMEOUT_MS     3000
