@@ -811,7 +811,7 @@ void drawKeyHints(const char* up, const char* down, const char* hash, const char
 
 // ───────── Screens ─────────
 void drawIdleScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("WATER ROWER");
 
     // Rowing person icon
@@ -857,7 +857,7 @@ void drawIdleScreen() {
 }
 
 void drawWorkoutScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("ROWING");
 
     unsigned long elapsed = workoutElapsedMs + (millis() - workoutStartMs);
@@ -925,7 +925,7 @@ void drawWorkoutScreen() {
 }
 
 void drawPausedScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("PAUSED");
 
     uint32_t sec = workoutElapsedMs / 1000;
@@ -970,7 +970,7 @@ void drawPausedScreen() {
 }
 
 void drawSummaryScreen(bool uploadOk) {
-    tft.fillScreen(COL_BG);
+
     drawHeader("SUMMARY");
 
     // Trophy icon
@@ -1024,7 +1024,7 @@ void drawSummaryScreen(bool uploadOk) {
 }
 
 void drawHistoryScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("HISTORY");
 
     if (historyCount == 0) {
@@ -1067,7 +1067,7 @@ void drawHistoryScreen() {
 }
 
 void drawUploadingScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("SAVING...");
 
     // Animated dots loading effect
@@ -1092,7 +1092,7 @@ void drawUploadingScreen() {
 }
 
 void drawAdminMenuScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("ADMIN MENU");
 
     tft.drawBitmap(56, 20, bmp_trophy, 16, 16, COL_WARN);
@@ -1115,7 +1115,7 @@ void drawAdminMenuScreen() {
 }
 
 void drawAdminWeightsScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("USER WEIGHTS");
 
     int total = USER_COUNT + 1;
@@ -1150,7 +1150,7 @@ void drawAdminWeightsScreen() {
 }
 
 void drawAdminWeightEditScreen() {
-    tft.fillScreen(COL_BG);
+
     bool isGuest = (adminEditUser == USER_COUNT);
     const char* name = isGuest ? "Guest" : userNames[adminEditUser];
 
@@ -1177,7 +1177,7 @@ void drawAdminWeightEditScreen() {
 }
 
 void drawCalibAuthScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("ADMIN ACCESS");
 
     tft.drawBitmap(56, 22, bmp_skull, 16, 16, COL_WARN);
@@ -1211,7 +1211,7 @@ void drawCalibAuthScreen() {
 }
 
 void drawCalibScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("CALIBRATION");
 
     tft.setTextSize(1);
@@ -1250,7 +1250,7 @@ void drawCalibScreen() {
 }
 
 void drawUserSelectScreen() {
-    tft.fillScreen(COL_BG);
+
     drawHeader("WHO ARE YOU?");
 
     // scroll up indicator
@@ -1618,14 +1618,17 @@ void handleInput() {
 
 // ───────── Display refresh ─────────
 unsigned long lastRedraw = 0;
-#define REDRAW_MS 250
+#define REDRAW_MS 1000
 Screen lastDrawnScreen = (Screen)-1;
 
 void refreshDisplay() {
-    bool needsRedraw = (currentScreen != lastDrawnScreen);
-    if (!needsRedraw && millis() - lastRedraw < REDRAW_MS) return;
+    bool screenChanged = (currentScreen != lastDrawnScreen);
+    if (!screenChanged && millis() - lastRedraw < REDRAW_MS) return;
     lastRedraw = millis();
-    lastDrawnScreen = currentScreen;
+    if (screenChanged) {
+        tft.fillScreen(COL_BG);   // clear only on screen transition
+        lastDrawnScreen = currentScreen;
+    }
 
     switch (currentScreen) {
         case SCR_IDLE:        drawIdleScreen(); break;
