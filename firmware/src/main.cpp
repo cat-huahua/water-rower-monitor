@@ -378,6 +378,11 @@ float    emaSpeed        = 0;           // smoothed boat speed (m/s)
 unsigned long strokeTimes[STROKE_TS_MAX] = {};
 int      strokeTsHead  = 0;             // ring: next write index
 int      strokeTsCount = 0;             // ring: valid entries
+// Drag k_eff from recovery deceleration (observational only; NOT fed to distance)
+#define  FLYWHEEL_INERTIA 0.1f          // kg*m^2 (rough; only scales displayed k_eff)
+float    kEff = 0;                      // smoothed effective drag (kg*m^2)
+unsigned long recoveryStartMs = 0;
+float    recoveryStartInterval = 0;
 
 // History
 #define MAX_HISTORY 10
@@ -963,9 +968,10 @@ void drawPausedScreen() {
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 84);   tft.printf("Dist: %.0f m", totalMeters);
-    tft.setCursor(4, 98);   tft.printf("Strokes: %d", strokeCount);
-    tft.setCursor(4, 112);  tft.printf("Cal: %.0f", totalCalories);
+    tft.setCursor(4, 82);   tft.printf("Dist: %.0f m", totalMeters);
+    tft.setCursor(4, 94);   tft.printf("Strokes: %d", strokeCount);
+    tft.setCursor(4, 106);  tft.printf("Cal: %.0f", totalCalories);
+    tft.setCursor(4, 118);  tft.printf("Drag k: %.4f", kEff);
 
     // Motivational nudge
     tft.setTextColor(COL_ACCENT);
@@ -1328,6 +1334,7 @@ void resetWorkout() {
     lastStrokeBoundary = 0; inDrive = false;
     emaIntervalMs = 0; extremaInterval = 0; emaSpeed = 0;
     strokeTsHead = 0; strokeTsCount = 0;
+    kEff = 0; recoveryStartMs = 0; recoveryStartInterval = 0;
     pulseCount = 0; displayPage = 0;
     lastPulseIntervalMs = 0;
 #ifdef SENSOR_TYPE_LDR
@@ -1397,6 +1404,20 @@ void processSensor() {
                     emaIntervalMs < extremaInterval * (1.0f - STROKE_HYST) &&
                     (now - lastStrokeBoundary > STROKE_MIN_MS)) {
                     inDrive = true;
+
+                    // estimate drag k_eff from the recovery that just ended:
+                    // during recovery 1/omega (proportional to interval) grows ~linearly,
+                    // slope = k/I  ->  k = I * (N/2pi) * d(interval_s)/dt_s
+                    if (recoveryStartMs > 0) {
+                        float dt_s  = (now - recoveryStartMs) / 1000.0f;
+                        float dIv_s = (extremaInterval - recoveryStartInterval) / 1000.0f;
+                        if (dt_s > 0.2f && dIv_s > 0.0f) {
+                            float kInst = FLYWHEEL_INERTIA * (PULSES_PER_REV / 6.2831853f)
+                                          * (dIv_s / dt_s);
+                            kEff = (kEff > 0) ? (0.7f * kEff + 0.3f * kInst) : kInst;
+                        }
+                    }
+
                     lastStrokeBoundary = now;
                     strokeCount++;
                     extremaInterval = emaIntervalMs;   // now track the min during drive
@@ -1412,6 +1433,8 @@ void processSensor() {
                 if (emaIntervalMs < extremaInterval || extremaInterval == 0) extremaInterval = emaIntervalMs;
                 if (emaIntervalMs > extremaInterval * (1.0f + STROKE_HYST)) {
                     inDrive = false;
+                    recoveryStartMs = now;
+                    recoveryStartInterval = emaIntervalMs;
                     extremaInterval = emaIntervalMs;   // now track the max during recovery
                 }
             }
@@ -1428,6 +1451,7 @@ void processSensor() {
         inDrive = false;
         lastStrokeBoundary = 0;   // next stroke after idle won't compute a bogus SPM
         strokeTsHead = 0; strokeTsCount = 0;
+        recoveryStartMs = 0;      // don't measure drag across a pause
     }
 }
 
