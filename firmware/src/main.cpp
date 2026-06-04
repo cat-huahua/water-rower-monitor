@@ -274,7 +274,7 @@ void loadCalibration() {
     prefs.begin("wrower", true);
     calMetersPerPulse = prefs.getFloat("mpp", METERS_PER_PULSE);
     // Heal implausible stored values (e.g. old 60x-too-small calibration)
-    if (calMetersPerPulse < 0.002f || calMetersPerPulse > 0.1f)
+    if (calMetersPerPulse < 0.00005f || calMetersPerPulse > 0.01f)
         calMetersPerPulse = METERS_PER_PULSE;
     for (int i = 0; i <= USER_COUNT; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
@@ -335,7 +335,15 @@ int displayPage = 0;
 // ───────── Sensor State ─────────
 uint32_t pulseCount     = 0;
 unsigned long lastPulseMs = 0;
-unsigned long lastPulseIntervalMs = 0;
+unsigned long lastPulseUsSnap = 0;  // ISR timestamp (us) of the newest accepted pulse
+
+// ω is averaged over a window of OMEGA_AVG_PULSES consecutive pulses (¼ rev).
+// Single-pulse intervals carry slot-geometry noise (uneven disc slots) of up to
+// ±10-20% at 60x the rev rate — enough to flip the drive/recovery detector even
+// past a 15% hysteresis. Averaging across many slots cancels that noise.
+#define OMEGA_AVG_PULSES (PULSES_PER_REV / 4)
+uint32_t      omegaMarkPulses = 0;  // pulse count at start of current averaging window
+unsigned long omegaMarkUs     = 0;  // ISR timestamp at start of window (0 = not seeded)
 
 #ifdef SENSOR_TYPE_LDR
 volatile bool          ldrPulseActive     = false;
@@ -425,8 +433,10 @@ void readAllButtons() {
     readButton(btnStar);
 }
 
+bool uiDirty = false;   // set on any consumed key press -> full redraw next refresh
+
 bool consume(Button &b) {
-    if (b.pressed) { b.pressed = false; return true; }
+    if (b.pressed) { b.pressed = false; uiDirty = true; return true; }
     return false;
 }
 
@@ -474,15 +484,12 @@ void readSensor() {
 
     noInterrupts();
     unsigned long pc = ldrPulseCount;
-    unsigned long interval = ldrPulseIntervalUs;
+    unsigned long lp = ldrLastPulseUs;
     interrupts();
 
     if (pc > pulseCount) {
-        unsigned long now = millis();
-        if (lastPulseMs > 0) {
-            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
-        }
-        lastPulseMs = now;
+        lastPulseMs = millis();
+        lastPulseUsSnap = lp;
         pulseCount = pc;
     }
 }
@@ -508,15 +515,12 @@ void readSensor() {
 
     noInterrupts();
     unsigned long pc = hallPulseCount;
-    unsigned long interval = hallPulseIntervalUs;
+    unsigned long lp = hallLastPulseUs;
     interrupts();
 
     if (pc > pulseCount) {
-        unsigned long now = millis();
-        if (lastPulseMs > 0) {
-            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
-        }
-        lastPulseMs = now;
+        lastPulseMs = millis();
+        lastPulseUsSnap = lp;
         pulseCount = pc;
     }
 }
@@ -542,15 +546,12 @@ void readSensor() {
 
     noInterrupts();
     unsigned long pc = blockerPulseCount;
-    unsigned long interval = blockerPulseIntervalUs;
+    unsigned long lp = blockerLastPulseUs;
     interrupts();
 
     if (pc > pulseCount) {
-        unsigned long now = millis();
-        if (lastPulseMs > 0) {
-            lastPulseIntervalMs = (interval > 0) ? interval / 1000 : (now - lastPulseMs);
-        }
-        lastPulseMs = now;
+        lastPulseMs = millis();
+        lastPulseUsSnap = lp;
         pulseCount = pc;
     }
 }
@@ -770,16 +771,16 @@ bool uploadToGitHub(uint32_t durSec) {
 void drawHeader(const char* title) {
     tft.fillRect(0, 0, TFT_WIDTH, 18, COL_HEADER_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT);
+    tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
     tft.setCursor(4, 5);
     tft.print(title);
     // BLE indicator
     tft.setCursor(TFT_WIDTH - 36, 5);
-    tft.setTextColor(bleClientConnected ? COL_VALUE : COL_LABEL);
+    tft.setTextColor(bleClientConnected ? COL_VALUE : COL_LABEL, COL_HEADER_BG);
     tft.print(bleClientConnected ? "BT" : "bt");
     // WiFi indicator
     tft.setCursor(TFT_WIDTH - 16, 5);
-    tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR);
+    tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR, COL_HEADER_BG);
     tft.print(WiFi.status() == WL_CONNECTED ? "W+" : "W-");
 }
 
@@ -789,10 +790,10 @@ void drawDivider(int y) {
 
 void drawLabelValue(int x, int y, const char* label, const char* value, uint16_t valColor = COL_VALUE) {
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(x, y);
     tft.print(label);
-    tft.setTextColor(valColor);
+    tft.setTextColor(valColor, COL_BG);
     tft.setCursor(x, y + 12);
     tft.setTextSize(2);
     tft.print(value);
@@ -802,7 +803,7 @@ void drawKeyHints(const char* up, const char* down, const char* hash, const char
     int y = TFT_HEIGHT - 11;
     tft.fillRect(0, y - 2, TFT_WIDTH, 13, COL_HEADER_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_HEADER_BG);  // text bg must match the bar
     if (up && up[0])   { tft.setCursor(2, y);   tft.printf("\x18%s", up); }
     if (down && down[0]){ tft.setCursor(36, y);  tft.printf("\x19%s", down); }
     if (hash && hash[0]){ tft.setCursor(68, y);  tft.printf("#%s", hash); }
@@ -824,7 +825,7 @@ void drawIdleScreen() {
     tft.drawBitmap(108, 28, bmp_wave, 16, 16, BLUE);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(30, 22);
     tft.print(MACHINE_SN);
 
@@ -833,23 +834,24 @@ void drawIdleScreen() {
     // Sensor value
     int sensorVal = getSensorRaw();
     tft.setCursor(4, 52);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setTextSize(1);
-    tft.printf("%s: %d", getSensorLabel(), sensorVal);
+    tft.printf("%s: %-4d", getSensorLabel(), sensorVal);  // pad: erase stale digits
 
     tft.setCursor(4, 66);
-    tft.setTextColor(COL_ACCENT);
+    tft.setTextColor(COL_ACCENT, COL_BG);
     tft.setTextSize(2);
     tft.print("READY");
 
-    // Random funny idle message
+    // Random funny idle message (messages differ in length/lines: clear area first)
+    tft.fillRect(0, 88, TFT_WIDTH, 16, COL_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(4, 88);
     tft.print(idle_msgs[millis() / 3000 % NUM_IDLE_MSGS]);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 108);
     tft.print("* START  # HISTORY");
 
@@ -866,13 +868,14 @@ void drawWorkoutScreen() {
     uint32_t s  = sec % 60;
 
     // Animated rower icon (alternates position)
+    tft.fillRect(4, 21, 24, 16, COL_BG);
     int rowerX = 4 + (millis() / 400 % 3) * 2;
     tft.drawBitmap(rowerX, 21, bmp_rower, 16, 16, COL_ACCENT);
 
     char timeBuf[16];
     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mn, s);
     tft.setTextSize(2);
-    tft.setTextColor(COL_TEXT);
+    tft.setTextColor(COL_TEXT, COL_BG);
     tft.setCursor(30, 24);
     tft.print(timeBuf);
 
@@ -880,9 +883,10 @@ void drawWorkoutScreen() {
 
     // Distance with fire icon when going fast
     char distBuf[16];
-    snprintf(distBuf, sizeof(distBuf), "%5.0f", totalMeters);
+    snprintf(distBuf, sizeof(distBuf), "%7.1f", totalMeters);
     drawLabelValue(4, 46, "DISTANCE (m)", distBuf);
 
+    tft.fillRect(108, 46, 16, 16, COL_BG);
     if (currentSpeed > 2.5f) {
         tft.drawBitmap(108, 46, bmp_fire, 16, 16, ST77XX_RED);
     }
@@ -892,7 +896,7 @@ void drawWorkoutScreen() {
         float secPer500 = 500.0f / currentSpeed;
         int sp_min = (int)(secPer500 / 60);
         int sp_sec = (int)secPer500 % 60;
-        snprintf(splitBuf, sizeof(splitBuf), "%d:%02d", sp_min, sp_sec);
+        snprintf(splitBuf, sizeof(splitBuf), "%2d:%02d", sp_min, sp_sec);  // fixed 5 chars: no residue
     } else {
         snprintf(splitBuf, sizeof(splitBuf), "--:--");
     }
@@ -900,22 +904,26 @@ void drawWorkoutScreen() {
 
     // Motivational message (changes every 10 seconds)
     drawDivider(103);
+    tft.fillRect(0, 105, TFT_WIDTH, 9, COL_BG);
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(4, 106);
     tft.print(fun_msgs[(sec / 10) % NUM_FUN_MSGS]);
 
-    // SPM & CAL
+    // SPM | STROKES | CAL
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 118);  tft.print("SPM");
-    tft.setCursor(68, 118); tft.print("CAL");
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setCursor(4,  118); tft.print("SPM");
+    tft.setCursor(48, 118); tft.print("STR");
+    tft.setCursor(92, 118); tft.print("CAL");
     tft.setTextSize(2);
-    tft.setTextColor(COL_VALUE);
-    tft.setCursor(4, 130);  tft.printf("%-3.0f", strokeRate);
-    tft.setCursor(68, 130); tft.printf("%.0f", totalCalories);
+    tft.setTextColor(COL_VALUE, COL_BG);
+    tft.setCursor(4,  130); tft.printf("%-3.0f", strokeRate);
+    tft.setCursor(48, 130); tft.printf("%-4lu", (unsigned long)strokeCount);
+    tft.setCursor(92, 130); tft.printf("%-3.0f", totalCalories);
 
     // Animated water at bottom
+    tft.fillRect(0, 148, TFT_WIDTH, 16, COL_BG);
     int waveOffset = (millis() / 300) % 16;
     for (int x = waveOffset - 16; x < 128; x += 16) {
         tft.drawBitmap(x, 148, bmp_wave, 16, 16, BLUE);
@@ -936,33 +944,33 @@ void drawPausedScreen() {
     tft.drawBitmap(4, 24, bmp_skull, 16, 16, COL_WARN);
 
     tft.setTextSize(2);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(28, 28);
     tft.print("PAUSED");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(28, 43);
     tft.print("Tired already?");
 
     char timeBuf[16];
     snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mn, s);
     tft.setTextSize(2);
-    tft.setTextColor(COL_TEXT);
+    tft.setTextColor(COL_TEXT, COL_BG);
     tft.setCursor(30, 58);
     tft.print(timeBuf);
 
     drawDivider(78);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
-    tft.setCursor(4, 82);   tft.printf("Dist: %.0f m", totalMeters);
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setCursor(4, 82);   tft.printf("Dist: %.1f m", totalMeters);
     tft.setCursor(4, 94);   tft.printf("Strokes: %d", strokeCount);
     tft.setCursor(4, 106);  tft.printf("Cal: %.0f", totalCalories);
     tft.setCursor(4, 118);  tft.printf("Drag k: %.4f", kEff);
 
     // Motivational nudge
-    tft.setTextColor(COL_ACCENT);
+    tft.setTextColor(COL_ACCENT, COL_BG);
     tft.setCursor(4, 130);
     tft.print("* = Get back in there!");
 
@@ -971,6 +979,7 @@ void drawPausedScreen() {
 
 void drawSummaryScreen(bool uploadOk) {
 
+    tft.fillScreen(COL_BG);
     drawHeader("SUMMARY");
 
     // Trophy icon
@@ -984,7 +993,7 @@ void drawSummaryScreen(bool uploadOk) {
     snprintf(buf, sizeof(buf), "%02d:%02d", mn, s);
     drawLabelValue(24, 22, "TIME", buf, COL_TEXT);
 
-    snprintf(buf, sizeof(buf), "%.0f", totalMeters);
+    snprintf(buf, sizeof(buf), "%.1f", totalMeters);
     drawLabelValue(4, 52, "DISTANCE (m)", buf);
 
     snprintf(buf, sizeof(buf), "%d", strokeCount);
@@ -997,7 +1006,7 @@ void drawSummaryScreen(bool uploadOk) {
 
     // Funny completion message
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(4, 112);
     tft.print(done_msgs[sec % NUM_DONE_MSGS]);
 
@@ -1005,17 +1014,17 @@ void drawSummaryScreen(bool uploadOk) {
     tft.setCursor(4, 126);
     if (currentUser == USER_COUNT) {
         tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_WARN);
-        tft.setTextColor(COL_WARN);
+        tft.setTextColor(COL_WARN, COL_BG);
         tft.setCursor(24, 128);
         tft.print("Guest - BT only");
     } else if (uploadOk) {
         tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_VALUE);
-        tft.setTextColor(COL_VALUE);
+        tft.setTextColor(COL_VALUE, COL_BG);
         tft.setCursor(24, 128);
         tft.print("Saved to NAS!");
     } else {
         tft.drawBitmap(4, 124, bmp_sad, 16, 16, COL_ERROR);
-        tft.setTextColor(COL_ERROR);
+        tft.setTextColor(COL_ERROR, COL_BG);
         tft.setCursor(24, 128);
         tft.print("Upload FAILED");
     }
@@ -1029,7 +1038,7 @@ void drawHistoryScreen() {
 
     if (historyCount == 0) {
         tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setCursor(20, 60);
         tft.print("No records yet");
     } else {
@@ -1038,10 +1047,10 @@ void drawHistoryScreen() {
         WorkoutRecord &r = history[idx];
 
         tft.setTextSize(1);
-        tft.setTextColor(COL_ACCENT);
+        tft.setTextColor(COL_ACCENT, COL_BG);
         tft.setCursor(4, 24);
         tft.printf("Record %d/%d", idx + 1, historyCount);
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setCursor(4, 38);
         tft.print(r.date);
 
@@ -1058,7 +1067,7 @@ void drawHistoryScreen() {
         drawLabelValue(68, 84, "STR", buf, COL_ACCENT);
 
         tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setCursor(4, 118);
         tft.printf("Cal: %.0f", r.calories);
     }
@@ -1068,18 +1077,19 @@ void drawHistoryScreen() {
 
 void drawUploadingScreen() {
 
+    tft.fillScreen(COL_BG);   // called directly from loop(), must clear itself
     drawHeader("SAVING...");
 
     // Animated dots loading effect
     tft.drawBitmap(56, 35, bmp_happy, 16, 16, COL_WARN);
 
     tft.setTextSize(2);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(10, 60);
     tft.print("Uploading");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(10, 85);
     tft.print("Sending to GitHub...");
     tft.setCursor(10, 100);
@@ -1100,15 +1110,15 @@ void drawAdminMenuScreen() {
     const char* items[] = {"Calibration", "User Weights"};
     for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
         int y = 44 + i * 22;
+        tft.setTextSize(1);
         if (i == adminMenuItem) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT);
+            tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
             tft.setCursor(6, y); tft.print("> ");
         } else {
-            tft.setTextColor(COL_LABEL);
+            tft.setTextColor(COL_LABEL, COL_BG);
             tft.setCursor(6, y); tft.print("  ");
         }
-        tft.setTextSize(1);
         tft.print(items[i]);
     }
     drawKeyHints("UP", "DN", "EXIT", "OK");
@@ -1129,21 +1139,23 @@ void drawAdminWeightsScreen() {
         bool isGuest = (i == USER_COUNT);
         const char* name = isGuest ? "Guest" : userNames[i];
 
+        // text background must match the row background (highlight bar vs plain)
+        uint16_t rowBg = (i == adminEditUser) ? COL_HEADER_BG : COL_BG;
         if (i == adminEditUser) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 24, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT);
+            tft.setTextColor(COL_ACCENT, rowBg);
         } else {
-            tft.setTextColor(COL_LABEL);
+            tft.setTextColor(COL_LABEL, rowBg);
         }
         tft.setTextSize(1);
         tft.setCursor(6, y);
         tft.print(name);
         tft.setTextSize(2);
-        tft.setTextColor(i == adminEditUser ? COL_VALUE : COL_DIVIDER);
+        tft.setTextColor(i == adminEditUser ? COL_VALUE : COL_DIVIDER, rowBg);
         tft.setCursor(TFT_WIDTH - 48, y);
         tft.printf("%.0f", userWeights[i]);
         tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, rowBg);
         tft.print("kg");
     }
     drawKeyHints("UP", "DN", "BACK", "EDIT");
@@ -1157,19 +1169,19 @@ void drawAdminWeightEditScreen() {
     drawHeader("EDIT WEIGHT");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_ACCENT);
+    tft.setTextColor(COL_ACCENT, COL_BG);
     tft.setCursor(4, 24);
     tft.print(name);
 
     tft.setTextSize(3);
-    tft.setTextColor(COL_VALUE);
+    tft.setTextColor(COL_VALUE, COL_BG);
     tft.setCursor(20, 50);
     tft.printf("%.0f", userWeights[adminEditUser]);
     tft.setTextSize(2);
     tft.print(" kg");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 100);
     tft.print("\x18 +1 kg    \x19 -1 kg");
 
@@ -1183,7 +1195,7 @@ void drawCalibAuthScreen() {
     tft.drawBitmap(56, 22, bmp_skull, 16, 16, COL_WARN);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 44);
     tft.print("Enter password:");
 
@@ -1197,13 +1209,13 @@ void drawCalibAuthScreen() {
 
     if (pwdWrong) {
         tft.setTextSize(1);
-        tft.setTextColor(COL_ERROR);
+        tft.setTextColor(COL_ERROR, COL_BG);
         tft.setCursor(4, 90);
         tft.print("WRONG PASSWORD!");
     }
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 108);
     tft.print("\x18=0  \x19=1  #=2  *=3");
 
@@ -1215,23 +1227,23 @@ void drawCalibScreen() {
     drawHeader("CALIBRATION");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 22);
     tft.print("METERS / PULSE");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_VALUE);
+    tft.setTextColor(COL_VALUE, COL_BG);
     tft.setCursor(4, 36);
     tft.printf("%.8f", calMetersPerPulse);
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 54);
     tft.printf("= %.4f m/rev", calMetersPerPulse * PULSES_PER_REV);
 
     drawDivider(68);
 
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(4, 74);
     tft.print("\x18 +0.000001");
     tft.setCursor(4, 88);
@@ -1242,7 +1254,7 @@ void drawCalibScreen() {
     tft.print("# CANCEL");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_WARN);
+    tft.setTextColor(COL_WARN, COL_BG);
     tft.setCursor(4, 132);
     tft.printf("Default: %.7f", (float)METERS_PER_PULSE);
 
@@ -1255,7 +1267,7 @@ void drawUserSelectScreen() {
 
     // scroll up indicator
     if (userScrollOffset > 0) {
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setTextSize(1);
         tft.setCursor(60, 20);
         tft.print("\x1e");  // ▲
@@ -1269,22 +1281,24 @@ void drawUserSelectScreen() {
         bool isGuest = (i == USER_COUNT);
         const char* name = isGuest ? "Guest" : userNames[i];
 
+        // text background must match the row background (highlight bar vs plain)
+        uint16_t rowBg = (i == currentUser) ? COL_HEADER_BG : COL_BG;
+        tft.setTextSize(1);
         if (i == currentUser) {
             tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT);
+            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT, rowBg);
             tft.setCursor(6, y);
             tft.print("> ");
         } else {
-            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL);
+            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL, rowBg);
             tft.setCursor(6, y);
             tft.print("  ");
         }
-        tft.setTextSize(1);
         tft.print(name);
 
         // counter on right (Guest shows no number)
         if (!isGuest) {
-            tft.setTextColor(COL_DIVIDER);
+            tft.setTextColor(COL_DIVIDER, rowBg);
             tft.setCursor(TFT_WIDTH - 20, y);
             tft.printf("%d/%d", i + 1, USER_COUNT);
         }
@@ -1292,7 +1306,7 @@ void drawUserSelectScreen() {
 
     // scroll down indicator
     if (userScrollOffset + USER_VISIBLE < USER_COUNT + 1) {
-        tft.setTextColor(COL_LABEL);
+        tft.setTextColor(COL_LABEL, COL_BG);
         tft.setTextSize(1);
         tft.setCursor(60, 140);
         tft.print("\x1f");  // ▼
@@ -1324,7 +1338,7 @@ void resetWorkout() {
     strokeTsHead = 0; strokeTsCount = 0;
     kEff = 0; recoveryStartMs = 0; recoveryStartInterval = 0;
     pulseCount = 0; displayPage = 0;
-    lastPulseIntervalMs = 0;
+    lastPulseUsSnap = 0; omegaMarkUs = 0; omegaMarkPulses = 0;
 #ifdef SENSOR_TYPE_LDR
     ldrPulseActive = false;
     ldrPulseCount = 0; ldrLastPulseUs = 0; ldrPulseIntervalUs = 0;
@@ -1369,15 +1383,28 @@ void processSensor() {
 
         unsigned long now = millis();
 
-        // Smooth the single-pulse interval (raw value is very noisy)
-        if (lastPulseIntervalMs > 0) {
-            float iv = (float)lastPulseIntervalMs;
-            emaIntervalMs = (emaIntervalMs > 0) ? (0.6f * emaIntervalMs + 0.4f * iv) : iv;
+        // ── ω estimate: average pulse interval over a ¼-rev window ──
+        // One clean sample per OMEGA_AVG_PULSES pulses; slot-geometry noise
+        // (uneven disc slots) averages out across the window instead of
+        // rattling the stroke detector at 60x the rev rate.
+        #define MAX_VALID_INTERVAL_MS 1000.0f   // < 1 rev/s: flywheel effectively stopped
+        if (omegaMarkUs == 0) {
+            omegaMarkUs     = lastPulseUsSnap;   // seed window at first pulse
+            omegaMarkPulses = pulseCount;
+        } else if (pulseCount - omegaMarkPulses >= OMEGA_AVG_PULSES) {
+            uint32_t n = pulseCount - omegaMarkPulses;
+            float avgIv = (float)(lastPulseUsSnap - omegaMarkUs) / 1000.0f / n;
+            omegaMarkUs     = lastPulseUsSnap;
+            omegaMarkPulses = pulseCount;
 
-            // Boat speed from smoothed angular velocity (omega ~ 1/interval), then smooth again
-            float spd = calMetersPerPulse / (emaIntervalMs / 1000.0f);
-            emaSpeed = (emaSpeed > 0) ? (0.7f * emaSpeed + 0.3f * spd) : spd;
-            currentSpeed = emaSpeed;
+            if (avgIv > 0 && avgIv < MAX_VALID_INTERVAL_MS) {
+                emaIntervalMs = (emaIntervalMs > 0) ? (0.5f * emaIntervalMs + 0.5f * avgIv) : avgIv;
+
+                // Boat speed from smoothed angular velocity (omega ~ 1/interval), then smooth again
+                float spd = calMetersPerPulse / (emaIntervalMs / 1000.0f);
+                emaSpeed = (emaSpeed > 0) ? (0.7f * emaSpeed + 0.3f * spd) : spd;
+                currentSpeed = emaSpeed;
+            }
         }
 
         // ── Stroke detection by flywheel accel/decel (peak/valley of omega) ──
@@ -1417,9 +1444,16 @@ void processSensor() {
                     strokeRate = computeSpm();
                 }
             } else {
-                // drive: track the min interval; a rise past hysteresis = recovery start
+                // drive: track the min interval; a rise past hysteresis = recovery start.
+                // Require a minimum drive duration: a noise blip flipping to "recovery"
+                // early in the drive would make the rest of the drive count as a second
+                // stroke (double counting).
+                #ifndef STROKE_MIN_DRIVE_MS
+                #define STROKE_MIN_DRIVE_MS 250
+                #endif
                 if (emaIntervalMs < extremaInterval || extremaInterval == 0) extremaInterval = emaIntervalMs;
-                if (emaIntervalMs > extremaInterval * (1.0f + STROKE_HYST)) {
+                if (emaIntervalMs > extremaInterval * (1.0f + STROKE_HYST) &&
+                    (now - lastStrokeBoundary > STROKE_MIN_DRIVE_MS)) {
                     inDrive = false;
                     recoveryStartMs = now;
                     recoveryStartInterval = emaIntervalMs;
@@ -1440,6 +1474,7 @@ void processSensor() {
         lastStrokeBoundary = 0;   // next stroke after idle won't compute a bogus SPM
         strokeTsHead = 0; strokeTsCount = 0;
         recoveryStartMs = 0;      // don't measure drag across a pause
+        omegaMarkUs = 0;          // restart the ω window: don't average across the gap
     }
 }
 
@@ -1623,10 +1658,20 @@ Screen lastDrawnScreen = (Screen)-1;
 
 void refreshDisplay() {
     bool screenChanged = (currentScreen != lastDrawnScreen);
-    if (!screenChanged && millis() - lastRedraw < REDRAW_MS) return;
+    // Full clear when entering a screen or after a key press changed UI state.
+    // Periodic redraws (workout timer, idle sensor value) repaint in place
+    // with background-colored text + targeted fillRects — no clear, no flicker.
+    bool needsClear = screenChanged || uiDirty;
+
+    // Screens with live data; everything else redraws only on input/transition
+    bool needsPeriodicRefresh = (currentScreen == SCR_WORKOUT || currentScreen == SCR_PAUSED ||
+                                 currentScreen == SCR_IDLE);
+
+    if (!needsClear && (!needsPeriodicRefresh || millis() - lastRedraw < REDRAW_MS)) return;
     lastRedraw = millis();
-    if (screenChanged) {
-        tft.fillScreen(COL_BG);   // clear only on screen transition
+    uiDirty = false;
+    if (needsClear) {
+        tft.fillScreen(COL_BG);
         lastDrawnScreen = currentScreen;
     }
 
@@ -1683,18 +1728,18 @@ void setup() {
 
     // Title
     tft.setTextSize(2);
-    tft.setTextColor(COL_ACCENT);
+    tft.setTextColor(COL_ACCENT, COL_BG);
     tft.setCursor(8, 20);
     tft.print("WATER");
     tft.setCursor(8, 38);
     tft.print("ROWER");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_VALUE);
+    tft.setTextColor(COL_VALUE, COL_BG);
     tft.setCursor(80, 25);
     tft.print("v2.0");
 
-    tft.setTextColor(COL_LABEL);
+    tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(20, 80);
 #ifdef SENSOR_TYPE_LDR
     tft.print("Sensor: LDR");
@@ -1784,6 +1829,7 @@ void loop() {
         drawSummaryScreen(ok);
         currentScreen = SCR_SUMMARY;
         lastDrawnScreen = SCR_SUMMARY;
+        uiDirty = false;   // summary drawn directly; a stale flag would blank it next frame
         return;
     }
 
