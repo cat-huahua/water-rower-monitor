@@ -116,7 +116,7 @@ Fully touch-driven — the board has no user keys.
 | Lid | `lid.stl` | Screen window + engraved label |
 | Tube socket | `tube_socket.stl` | 18mm mount for WaterRower arm |
 
-Finished size is 71.6 × 94.1 × 19.6 mm — there is no battery door because the
+Finished size is 74.9 × 94.0 × 18.7 mm — there is no battery door because the
 power bank stays outside.
 
 Board geometry comes from Waveshare's own outline drawing, so the PCB size
@@ -139,7 +139,7 @@ Each workout is saved as JSON to your TrueNAS share:
   "machine_sn": "132224",
   "machine_model": "Water Rower USA",
   "date": "2026-04-02T18:30:25Z",
-  "user": "XiuYuan",
+  "user": "Alice",
   "duration_sec": 1800,
   "distance_m": 6500,
   "strokes": 450,

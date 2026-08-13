@@ -27,7 +27,7 @@
 | 9 | 魔术贴 / 扎带 | 2 | 把充电宝绑在划船机管子上 |
 
 > 充电宝放在外壳**外面**。这样传感器的 5V 自动解决（VBus = USB 5V），
-> 外壳也不用装电池，整机只有 19.6mm 厚，换电池充电都不用拆壳。
+> 外壳也不用装电池，整机只有 18.7mm 厚，换电池充电都不用拆壳。
 
 > ⚠️ 如果哪天不用充电宝、改接板载 MX1.25 电池座：**必须是 3.7V 单节 (1S)**。
 > 7.4V 的 2S 电池会烧掉板载充电电路和主控，接反极性同样烧板。
@@ -40,7 +40,7 @@
 | `lid.stl` | 盖子 (屏幕开窗 + 刻字) | 20% | 无 |
 | `tube_socket.stl` | 18mm 管座 (插原机金属管) | 40% | 无 |
 
-> 全部 0.2mm 层高, PLA 或 PETG。成品 71.6 × 94.1 × 19.6mm。
+> 全部 0.2mm 层高, PLA 或 PETG。成品 74.9 × 94.0 × 18.7mm。
 > 没有电池盖 —— 充电宝在外面。
 
 ### 螺丝
@@ -314,8 +314,8 @@ pio device monitor
 
 ```
 /mnt/pool/water_rower_records/
-├── XiuYuan_20260402_183025.json
-└── YongTing_20260403_071512.json
+├── Alice_20260402_183025.json
+└── Bob_20260403_071512.json
 ```
 
 ```json
@@ -323,7 +323,7 @@ pio device monitor
     "machine_sn": "132224",
     "machine_model": "Water Rower USA",
     "date": "2026-04-02T18:30:25Z",
-    "user": "XiuYuan",
+    "user": "Alice",
     "duration_sec": 1800,
     "distance_m": 6500,
     "strokes": 450,
