@@ -426,73 +426,148 @@ WorkoutRecord history[MAX_HISTORY];
 int historyCount = 0;
 
 // ═══════════════════════════════════════════════════════════════════════
-//  CST328 capacitive touch
+//  Capacitive touch — CST328 (V1 boards) or CST3530 (V2 boards)
 // ═══════════════════════════════════════════════════════════════════════
-// Register map and access pattern follow the Waveshare reference driver:
-// 16-bit register addresses, a point count at 0xD005, packed coordinates at
-// 0xD000, and a mandatory write-back of 0 to 0xD005 to release the frame.
-#define CST_REG_POINT_COUNT   0xD005
-#define CST_REG_XY            0xD000
-#define CST_REG_DEBUG_INFO    0xD101
-#define CST_REG_NORMAL_MODE   0xD109
-#define CST_REG_INFO_TP_NTX   0xD1F4
+// Which controller is fitted depends on the board revision, and the two speak
+// genuinely different protocols: CST328 uses 16-bit register addresses, a STOP
+// before each read and a 0xCACA handshake; CST3530 uses 32-bit addresses, a
+// repeated START, and no handshake at all. Both addresses are probed at boot
+// and the matching path is selected, so one binary serves either board.
 
-static bool cstRead(uint16_t reg, uint8_t* buf, size_t len) {
-    Wire1.beginTransmission(TOUCH_I2C_ADDR);
+// CST328 registers (16-bit addressing)
+#define CST328_REG_POINT_COUNT   0xD005
+#define CST328_REG_XY            0xD000
+#define CST328_REG_DEBUG_INFO    0xD101
+#define CST328_REG_NORMAL_MODE   0xD109
+#define CST328_REG_INFO_TP_NTX   0xD1F4
+
+// CST3530 registers (32-bit addressing)
+#define CST3530_REG_DATA         0xD0070000
+#define CST3530_REG_COORD_NEXT   0xD0070900
+#define CST3530_REG_END_READ     0xD00002AB
+
+enum TouchChip { TOUCH_CHIP_NONE, TOUCH_CHIP_CST328, TOUCH_CHIP_CST3530 };
+static TouchChip touchChip = TOUCH_CHIP_NONE;
+
+static bool i2cProbe(uint8_t addr) {
+    Wire1.beginTransmission(addr);
+    return Wire1.endTransmission(true) == 0;
+}
+
+// ── CST328: 16-bit register address, STOP before the read ──
+static bool cst328Read(uint16_t reg, uint8_t* buf, size_t len) {
+    Wire1.beginTransmission(TOUCH_ADDR_CST328);
     Wire1.write((uint8_t)(reg >> 8));
     Wire1.write((uint8_t)reg);
     if (Wire1.endTransmission(true) != 0) return false;
-    if (Wire1.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)len) != len) return false;
+    if (Wire1.requestFrom((uint8_t)TOUCH_ADDR_CST328, (uint8_t)len) != len) return false;
     for (size_t i = 0; i < len; i++) buf[i] = Wire1.read();
     return true;
 }
 
-static bool cstWrite(uint16_t reg, const uint8_t* data, size_t len) {
-    Wire1.beginTransmission(TOUCH_I2C_ADDR);
+static bool cst328Write(uint16_t reg, const uint8_t* data, size_t len) {
+    Wire1.beginTransmission(TOUCH_ADDR_CST328);
     Wire1.write((uint8_t)(reg >> 8));
     Wire1.write((uint8_t)reg);
     for (size_t i = 0; i < len; i++) Wire1.write(data[i]);
     return Wire1.endTransmission(true) == 0;
 }
 
-static void cstReset() {
-    digitalWrite(TOUCH_RST, HIGH); delay(50);
-    digitalWrite(TOUCH_RST, LOW);  delay(5);
-    digitalWrite(TOUCH_RST, HIGH); delay(50);
+// ── CST3530: 32-bit register address, repeated START before the read ──
+static bool cst3530Read(uint32_t reg, uint8_t* buf, size_t len) {
+    Wire1.beginTransmission(TOUCH_ADDR_CST3530);
+    for (int i = 3; i >= 0; i--) Wire1.write((uint8_t)(reg >> (i * 8)));
+    if (Wire1.endTransmission(false) != 0) return false;   // repeated START
+    if (Wire1.requestFrom((uint8_t)TOUCH_ADDR_CST3530, (uint8_t)len) != len) return false;
+    for (size_t i = 0; i < len; i++) buf[i] = Wire1.read();
+    return true;
 }
 
-// Handshake: enter debug-info mode, read the 24-byte info block (bytes 10-11
-// read back 0xCACA on a healthy panel), then switch to normal reporting mode.
-static bool cstInit() {
-    uint8_t buf[24] = {};
+static bool cst3530Write(uint32_t reg, const uint8_t* data, size_t len) {
+    Wire1.beginTransmission(TOUCH_ADDR_CST3530);
+    for (int i = 3; i >= 0; i--) Wire1.write((uint8_t)(reg >> (i * 8)));
+    for (size_t i = 0; i < len; i++) Wire1.write(data[i]);
+    return Wire1.endTransmission(true) == 0;
+}
+
+// Long enough for either part: CST328 needs >100 us low and ~50 ms to return,
+// CST3530 asks for 100 ms low and 500 ms to settle.
+static void touchReset() {
+    digitalWrite(TOUCH_RST, LOW);  delay(100);
+    digitalWrite(TOUCH_RST, HIGH); delay(500);
+}
+
+static bool touchInit() {
     Wire1.begin(TOUCH_SDA, TOUCH_SCL, TOUCH_I2C_HZ);
     pinMode(TOUCH_INT, INPUT);
     pinMode(TOUCH_RST, OUTPUT);
-    cstReset();
+    touchReset();
 
-    cstWrite(CST_REG_DEBUG_INFO, nullptr, 0);
-    if (!cstRead(CST_REG_INFO_TP_NTX, buf, sizeof(buf))) return false;
-    uint16_t verify = ((uint16_t)buf[11] << 8) | buf[10];
-    cstWrite(CST_REG_NORMAL_MODE, nullptr, 0);
+    // Scanning first separates "nothing on this bus" (wiring/pins) from "a chip
+    // answers but not the one we expected" (board revision) — different fixes.
+    Serial.print("[TOUCH] I2C scan:");
+    int found = 0;
+    for (uint8_t a = 1; a < 127; a++)
+        if (i2cProbe(a)) { Serial.printf(" 0x%02X", a); found++; }
+    Serial.println(found ? "" : " nothing responded");
 
-    Serial.printf("[TOUCH] CST328 id 0x%04X %s\n", verify,
-                  verify == 0xCACA ? "OK" : "UNEXPECTED");
-    return verify == 0xCACA;
+    if (i2cProbe(TOUCH_ADDR_CST3530)) {
+        touchChip = TOUCH_CHIP_CST3530;
+        Serial.println("[TOUCH] CST3530 (V2 board) ready at 0x58");
+        return true;                       // no handshake defined for this part
+    }
+
+    if (i2cProbe(TOUCH_ADDR_CST328)) {
+        uint8_t buf[24] = {};
+        cst328Write(CST328_REG_DEBUG_INFO, nullptr, 0);
+        if (!cst328Read(CST328_REG_INFO_TP_NTX, buf, sizeof(buf))) {
+            Serial.println("[TOUCH] CST328 answered but its info block read failed");
+            return false;
+        }
+        uint16_t verify = ((uint16_t)buf[11] << 8) | buf[10];
+        cst328Write(CST328_REG_NORMAL_MODE, nullptr, 0);
+        Serial.printf("[TOUCH] CST328 (V1 board) id 0x%04X %s\n", verify,
+                      verify == 0xCACA ? "OK" : "UNEXPECTED");
+        if (verify != 0xCACA) return false;
+        touchChip = TOUCH_CHIP_CST328;
+        return true;
+    }
+
+    Serial.println("[TOUCH] no known touch controller on the bus");
+    return false;
 }
 
 // One point only — this UI never needs multitouch.
-static bool cstReadPoint(int16_t* px, int16_t* py) {
-    uint8_t n = 0, clear = 0, d[5];
-    if (!cstRead(CST_REG_POINT_COUNT, &n, 1)) return false;
-    n &= 0x0F;
-    if (n == 0 || n > 5) { cstWrite(CST_REG_POINT_COUNT, &clear, 1); return false; }
-    bool ok = cstRead(CST_REG_XY, d, sizeof(d));
-    cstWrite(CST_REG_POINT_COUNT, &clear, 1);
-    if (!ok) return false;
+static bool touchReadPoint(int16_t* px, int16_t* py) {
+    int16_t x = 0, y = 0;
 
-    // d[1]=X high 8, d[2]=Y high 8, d[3]=low nibbles (X high half, Y low half)
-    int16_t x = ((int16_t)d[1] << 4) | (d[3] >> 4);
-    int16_t y = ((int16_t)d[2] << 4) | (d[3] & 0x0F);
+    if (touchChip == TOUCH_CHIP_CST3530) {
+        uint8_t b[9];
+        if (!cst3530Read(CST3530_REG_DATA, b, sizeof(b))) return false;
+        uint8_t n = b[3] & 0x0F;
+        bool valid = (n >= 1 && n <= 5) && (b[8] & 0xF0);
+        // The frame must be released whether or not it held a touch.
+        cst3530Write(CST3530_REG_END_READ, nullptr, 0);
+        if (!valid) return false;
+        // 12-bit coords: low byte separate, high nibbles packed into b[7].
+        x = (int16_t)((((uint16_t)b[7] & 0x0F) << 8) | b[4]);
+        y = (int16_t)((((uint16_t)b[7] & 0xF0) << 4) | b[5]);
+
+    } else if (touchChip == TOUCH_CHIP_CST328) {
+        uint8_t n = 0, clear = 0, d[5];
+        if (!cst328Read(CST328_REG_POINT_COUNT, &n, 1)) return false;
+        n &= 0x0F;
+        if (n == 0 || n > 5) { cst328Write(CST328_REG_POINT_COUNT, &clear, 1); return false; }
+        bool ok = cst328Read(CST328_REG_XY, d, sizeof(d));
+        cst328Write(CST328_REG_POINT_COUNT, &clear, 1);
+        if (!ok) return false;
+        // d[1]=X high 8, d[2]=Y high 8, d[3]=low nibbles (X high half, Y low half)
+        x = ((int16_t)d[1] << 4) | (d[3] >> 4);
+        y = ((int16_t)d[2] << 4) | (d[3] & 0x0F);
+
+    } else {
+        return false;
+    }
 
     if (TOUCH_SWAP_XY)  { int16_t t = x; x = y; y = t; }
     if (TOUCH_MIRROR_X) x = TFT_WIDTH  - 1 - x;
@@ -502,7 +577,6 @@ static bool cstReadPoint(int16_t* px, int16_t* py) {
     *py = constrain(y, (int16_t)0, (int16_t)(TFT_HEIGHT - 1));
     return true;
 }
-
 // ───────── Touch event state ─────────
 struct TouchState {
     bool          down;         // finger currently on the panel
@@ -526,7 +600,7 @@ void pollTouch() {
     lastPoll = millis();
 
     int16_t x, y;
-    bool contact = cstReadPoint(&x, &y);
+    bool contact = touchReadPoint(&x, &y);
     unsigned long now = millis();
 
     if (contact) {
@@ -2145,6 +2219,9 @@ void refreshDisplay() {
 // ───────── Setup ─────────
 void setup() {
     Serial.begin(115200);
+    // Serial rides on USB CDC here; without a moment to enumerate, every log
+    // line printed during init is lost — including the touch diagnostics.
+    delay(400);
 
     // Backlight (LEDC channel 0)
     ledcSetup(0, 5000, 8);
@@ -2162,7 +2239,7 @@ void setup() {
 
     // Touch panel. It is the only input on this board, so a failure has to be
     // visible on the panel itself — otherwise the device just looks frozen.
-    bool touchOk = cstInit();
+    bool touchOk = touchInit();
     if (!touchOk) {
         Serial.println("[TOUCH] CST328 init failed — UI will not respond");
         drawCentered(120, "TOUCH INIT FAILED", 2, COL_ERROR);

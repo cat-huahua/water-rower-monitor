@@ -247,8 +247,10 @@ pio device monitor
 | 现象 | 说明 |
 |------|------|
 | 屏幕亮，显示待机页 | 正常 |
-| 屏幕亮但点哪都没反应 | 触摸没起来，看串口 `[TOUCH] CST328 ...` |
-| 开机闪 `TOUCH INIT FAILED` | CST328 排线/I2C 有问题 |
+| 屏幕亮但点哪都没反应 | 触摸没起来，看串口 `[TOUCH] ...` |
+| 串口打印 `CST3530 (V2 board) ready` | 正常 —— V2 板子 |
+| 串口打印 `CST328 (V1 board) id 0xCACA OK` | 正常 —— V1 板子 |
+| 开机闪 `TOUCH INIT FAILED` | 看串口的 `I2C scan:` 一行：没扫到地址 = 排线/I2C 问题；扫到别的地址 = 又是新版触摸芯片 |
 | 有开机提示音 | I2S 喇叭正常（音量还可以拧板上的旋钮） |
 | 待机页显示 `SENSOR: clear` | 传感器连上了 |
 

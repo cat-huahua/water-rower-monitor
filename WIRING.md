@@ -11,7 +11,7 @@
 | 功能 | 芯片 | 引脚 |
 |------|------|------|
 | LCD | ST7789 240×320 SPI | SCK=40, MOSI=45, CS=42, DC=41, RST=39, BL=5 |
-| 触摸 | CST328 (I2C1, 地址 0x1A) | SDA=1, SCL=3, RST=2, INT=4 |
+| 触摸 | CST328 (V1, 0x1A) 或 CST3530 (V2, 0x58) | SDA=1, SCL=3, RST=2, INT=4 |
 | 音频 | PCM5101 I2S DAC + 功放 | BCK=48, LRCK=38, DIN=47 |
 | IMU / RTC | QMI8658 / PCF85063 (I2C0) | SCL=10, SDA=11 (本固件未使用) |
 | TF 卡 | SPI | CS=21, SCK=14, MOSI=17, MISO=16 (本固件未使用) |
