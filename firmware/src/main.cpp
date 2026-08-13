@@ -1,34 +1,32 @@
 /*
- * Water Rower Monitor — ESP32-S3
+ * Water Rower Monitor — Waveshare ESP32-S3-Touch-LCD-2.8
  * Replacement console for Water Rower USA (SN 132224)
  *
  * Hardware:
- *   - ESP32-S3 DevKitC-1
- *   - ST7735S 1.8" 128x160 TFT with 4 built-in keys
- *   - Sensor: LDR (光敏电阻) OR Hall effect (霍尔传感器)
- *     Choose in config.h: SENSOR_TYPE_LDR or SENSOR_TYPE_HALL
- *   - Speaker (喇叭) — for sound feedback
- *   - Large half breadboard (165x55mm)
+ *   - Waveshare ESP32-S3-Touch-LCD-2.8 (ESP32-S3R8, 16MB flash, 8MB PSRAM)
+ *   - ST7789 2.8" 240x320 IPS, SPI2 — see config.h for the fixed pin map
+ *   - CST328 capacitive touch, I2C bus 1 — the only user input on this board
+ *   - PCM5101 I2S DAC + amplifier + speaker header (tones, no PWM buzzer)
+ *   - Sensor: optical blocker (原机光遮断器) OR hall effect, on 12PIN GPIO18
+ *     Choose in config.h: SENSOR_TYPE_BLOCKER or SENSOR_TYPE_HALL
  *
- * Sensor options:
- *   LDR:  Original WaterRower optical sensor (analog read)
- *   Hall: A3144/OH3144 + magnet on flywheel (digital interrupt)
- *
- * Keys (on TFT module):
- *   * (K4)  = Start / Resume
- *   # (K3)  = Stop & save / Back
- *   UP (K1) = Scroll up / Brightness+
- *   DN (K2) = Scroll down / Brightness-
+ * Input model:
+ *   The board has no keys beyond BOOT/RESET, so every screen is driven by
+ *   on-screen touch targets registered through beginBtns()/addBtn(): the same
+ *   rectangle is both drawn and hit-tested, so the two can never drift apart.
+ *   Admin opens by HOLDING the title bar on the idle screen for 3 s.
  */
 
 #include <Arduino.h>
 #include <Preferences.h>
 #include <SPI.h>
+#include <Wire.h>
 #include <WiFi.h>
 #include <HTTPClient.h>
 #include <Adafruit_GFX.h>
-#include <Adafruit_ST7735.h>
+#include <Adafruit_ST7789.h>
 #include <ArduinoJson.h>
+#include <driver/i2s.h>
 #include <mbedtls/base64.h>
 #include <BLEDevice.h>
 #include <BLEServer.h>
@@ -206,7 +204,7 @@ static const char* const idle_msgs[] = {
     "The water awaits...",
     "Don't be lazy!",
     "Let's GOOO!",
-    "Calories won't burn\nthemselves",
+    "Calories won't burn themselves",
     "Your muscles miss you",
     "Row or regret?",
     "Just one more session",
@@ -233,10 +231,23 @@ static const char* const done_msgs[] = {
 #define COL_LABEL     0x7BEF
 #define COL_HEADER_BG 0x000F
 #define COL_DIVIDER   0x4208
-#define BLUE          0x1C9F  // water blue
+#define COL_BTN_BG    0x18E3   // idle button fill
+#define BLUE          0x1C9F   // water blue
+
+// ───────── Layout (240x320 portrait) ─────────
+#define UI_MARGIN     6
+#define HEADER_H      32
+#define BAR_H         60                       // bottom action bar
+#define BAR_Y         (TFT_HEIGHT - BAR_H)
+#define BTN_H         52
+#define BTN_Y         (BAR_Y + (BAR_H - BTN_H) / 2)
+#define CONTENT_Y     (HEADER_H + 4)
 
 // ───────── Display ─────────
-Adafruit_ST7735 tft = Adafruit_ST7735(TFT_CS, TFT_DC, TFT_MOSI, TFT_SCLK, TFT_RST);
+// Hardware SPI: the software-SPI constructor used on the old ST7735 build
+// bit-bangs ~150 kB per full repaint here, which is seconds per frame.
+SPIClass tftSPI(FSPI);
+Adafruit_ST7789 tft = Adafruit_ST7789(&tftSPI, TFT_CS, TFT_DC, TFT_RST);
 uint8_t brightness = 200;
 
 // ───────── BLE FTMS (Fitness Machine Service) ─────────
@@ -278,7 +289,7 @@ void loadCalibration() {
         calMetersPerPulse = METERS_PER_PULSE;
     for (int i = 0; i <= USER_COUNT; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
-        userWeights[i] = prefs.getFloat(key, 70.0f);
+        userWeights[i] = prefs.getFloat(key, DEFAULT_WEIGHT_KG);
     }
     prefs.end();
 }
@@ -296,44 +307,49 @@ void saveWeights() {
     prefs.end();
 }
 
-// ───────── Combo / Password detector ─────────
-static const uint8_t calibCombo[]    = CALIB_COMBO;
-static const uint8_t calibPassword[] = CALIB_PASSWORD;
+// ───────── Admin password ─────────
+// Active admin password: config.h value is the factory default; can be
+// changed from the admin menu (stored in NVS, key "apwd").
+uint8_t adminPwd[CALIB_PASSWORD_LEN] = CALIB_PASSWORD;
 
-uint8_t comboBuffer[CALIB_COMBO_LEN] = {};
-uint8_t comboPos = 0;
+void loadAdminPwd() {
+    prefs.begin("wrower", true);
+    if (prefs.getBytesLength("apwd") == CALIB_PASSWORD_LEN)
+        prefs.getBytes("apwd", adminPwd, CALIB_PASSWORD_LEN);
+    prefs.end();
+}
+void saveAdminPwd() {
+    prefs.begin("wrower", false);
+    prefs.putBytes("apwd", adminPwd, CALIB_PASSWORD_LEN);
+    prefs.end();
+}
+
 uint8_t pwdBuffer[CALIB_PASSWORD_LEN] = {};
 uint8_t pwdPos   = 0;
 bool    pwdWrong = false;
 
-void pushCombo(uint8_t btn) {
-    // Shift buffer
-    for (int i = 0; i < CALIB_COMBO_LEN - 1; i++) comboBuffer[i] = comboBuffer[i+1];
-    comboBuffer[CALIB_COMBO_LEN - 1] = btn;
-    comboPos++;
-}
-bool checkCombo() {
-    if (comboPos < CALIB_COMBO_LEN) return false;
-    for (int i = 0; i < CALIB_COMBO_LEN; i++)
-        if (comboBuffer[i] != calibCombo[i]) return false;
-    return true;
-}
-
 // ───────── Admin state ─────────
 int adminMenuItem  = 0;   // selected menu item
 int adminEditUser  = 0;   // user being edited in weight screen
-#define ADMIN_MENU_COUNT 2
+int adminWeightScroll = 0; // first visible row of the weights list — shared by
+                           // the drawing pass and the tap handler so a row tap
+                           // always resolves to the user that was drawn there
+#define ADMIN_MENU_COUNT 3
 
-// Long-press * on the idle screen opens admin (robust entry: the combo is
-// easy to fumble because # and a failed * both navigate away from idle).
+// Password edit (double entry to confirm; inactivity timeout = cancel)
+uint8_t       pwdNew[CALIB_PASSWORD_LEN] = {};
+uint8_t       pwdConfirmPhase = 0;       // 0 = first entry, 1 = re-enter
+unsigned long pwdEditLastKeyMs = 0;
+#define PWD_EDIT_TIMEOUT_MS 10000
+
+// Hold the title bar on the idle screen to open admin.
 #define ADMIN_HOLD_MS 3000
-unsigned long starPressMs = 0;   // press-edge time of * on idle; 0 = not armed
 
 // ───────── State machine ─────────
 enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
               SCR_UPLOADING, SCR_HISTORY,
               SCR_CALIB_AUTH, SCR_ADMIN_MENU, SCR_CALIB,
-              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT };
+              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT, SCR_ADMIN_PWD_EDIT };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -409,47 +425,300 @@ struct WorkoutRecord {
 WorkoutRecord history[MAX_HISTORY];
 int historyCount = 0;
 
-// ───────── Buttons ─────────
-struct Button {
-    uint8_t pin;
-    bool    lastState;
-    unsigned long lastDebounce;
-    bool    pressed;
+// ═══════════════════════════════════════════════════════════════════════
+//  CST328 capacitive touch
+// ═══════════════════════════════════════════════════════════════════════
+// Register map and access pattern follow the Waveshare reference driver:
+// 16-bit register addresses, a point count at 0xD005, packed coordinates at
+// 0xD000, and a mandatory write-back of 0 to 0xD005 to release the frame.
+#define CST_REG_POINT_COUNT   0xD005
+#define CST_REG_XY            0xD000
+#define CST_REG_DEBUG_INFO    0xD101
+#define CST_REG_NORMAL_MODE   0xD109
+#define CST_REG_INFO_TP_NTX   0xD1F4
+
+static bool cstRead(uint16_t reg, uint8_t* buf, size_t len) {
+    Wire1.beginTransmission(TOUCH_I2C_ADDR);
+    Wire1.write((uint8_t)(reg >> 8));
+    Wire1.write((uint8_t)reg);
+    if (Wire1.endTransmission(true) != 0) return false;
+    if (Wire1.requestFrom((uint8_t)TOUCH_I2C_ADDR, (uint8_t)len) != len) return false;
+    for (size_t i = 0; i < len; i++) buf[i] = Wire1.read();
+    return true;
+}
+
+static bool cstWrite(uint16_t reg, const uint8_t* data, size_t len) {
+    Wire1.beginTransmission(TOUCH_I2C_ADDR);
+    Wire1.write((uint8_t)(reg >> 8));
+    Wire1.write((uint8_t)reg);
+    for (size_t i = 0; i < len; i++) Wire1.write(data[i]);
+    return Wire1.endTransmission(true) == 0;
+}
+
+static void cstReset() {
+    digitalWrite(TOUCH_RST, HIGH); delay(50);
+    digitalWrite(TOUCH_RST, LOW);  delay(5);
+    digitalWrite(TOUCH_RST, HIGH); delay(50);
+}
+
+// Handshake: enter debug-info mode, read the 24-byte info block (bytes 10-11
+// read back 0xCACA on a healthy panel), then switch to normal reporting mode.
+static bool cstInit() {
+    uint8_t buf[24] = {};
+    Wire1.begin(TOUCH_SDA, TOUCH_SCL, TOUCH_I2C_HZ);
+    pinMode(TOUCH_INT, INPUT);
+    pinMode(TOUCH_RST, OUTPUT);
+    cstReset();
+
+    cstWrite(CST_REG_DEBUG_INFO, nullptr, 0);
+    if (!cstRead(CST_REG_INFO_TP_NTX, buf, sizeof(buf))) return false;
+    uint16_t verify = ((uint16_t)buf[11] << 8) | buf[10];
+    cstWrite(CST_REG_NORMAL_MODE, nullptr, 0);
+
+    Serial.printf("[TOUCH] CST328 id 0x%04X %s\n", verify,
+                  verify == 0xCACA ? "OK" : "UNEXPECTED");
+    return verify == 0xCACA;
+}
+
+// One point only — this UI never needs multitouch.
+static bool cstReadPoint(int16_t* px, int16_t* py) {
+    uint8_t n = 0, clear = 0, d[5];
+    if (!cstRead(CST_REG_POINT_COUNT, &n, 1)) return false;
+    n &= 0x0F;
+    if (n == 0 || n > 5) { cstWrite(CST_REG_POINT_COUNT, &clear, 1); return false; }
+    bool ok = cstRead(CST_REG_XY, d, sizeof(d));
+    cstWrite(CST_REG_POINT_COUNT, &clear, 1);
+    if (!ok) return false;
+
+    // d[1]=X high 8, d[2]=Y high 8, d[3]=low nibbles (X high half, Y low half)
+    int16_t x = ((int16_t)d[1] << 4) | (d[3] >> 4);
+    int16_t y = ((int16_t)d[2] << 4) | (d[3] & 0x0F);
+
+    if (TOUCH_SWAP_XY)  { int16_t t = x; x = y; y = t; }
+    if (TOUCH_MIRROR_X) x = TFT_WIDTH  - 1 - x;
+    if (TOUCH_MIRROR_Y) y = TFT_HEIGHT - 1 - y;
+
+    *px = constrain(x, (int16_t)0, (int16_t)(TFT_WIDTH  - 1));
+    *py = constrain(y, (int16_t)0, (int16_t)(TFT_HEIGHT - 1));
+    return true;
+}
+
+// ───────── Touch event state ─────────
+struct TouchState {
+    bool          down;         // finger currently on the panel
+    int16_t       x, y;         // latest position
+    int16_t       downX, downY; // where the contact started
+    unsigned long downMs;
+    bool          tap;          // one-shot: a qualified tap completed
+    int16_t       tapX, tapY;
+    bool          hold;         // one-shot: contact passed ADMIN_HOLD_MS
+    bool          holdFired;    // suppress repeat holds within one contact
+    int16_t       swipe;        // one-shot: -1 = swipe up, +1 = swipe down
 };
-Button btnUp   = {BTN_UP_PIN,   true, 0, false};
-Button btnDown = {BTN_DOWN_PIN, true, 0, false};
-Button btnHash = {BTN_HASH_PIN, true, 0, false};
-Button btnStar = {BTN_STAR_PIN, true, 0, false};
-#define DEBOUNCE_MS 180
+TouchState touch = {};
+bool uiDirty  = false;   // consumed input -> full redraw next refresh
+bool btnDirty = false;   // press/release only -> repaint buttons in place
 
-void readButton(Button &b) {
-    bool state = digitalRead(b.pin);
-    if (state != b.lastState && (millis() - b.lastDebounce > DEBOUNCE_MS)) {
-        b.lastDebounce = millis();
-        if (state == LOW) b.pressed = true;
+// Polls the panel and turns raw contacts into tap / hold / swipe events.
+void pollTouch() {
+    static unsigned long lastPoll = 0;
+    if (millis() - lastPoll < TOUCH_POLL_MS) return;
+    lastPoll = millis();
+
+    int16_t x, y;
+    bool contact = cstReadPoint(&x, &y);
+    unsigned long now = millis();
+
+    if (contact) {
+        if (!touch.down) {                       // press edge
+            touch.down   = true;
+            touch.downX  = x;  touch.downY = y;
+            touch.downMs = now;
+            touch.holdFired = false;
+            btnDirty = true;                     // show the pressed state
+        }
+        touch.x = x; touch.y = y;
+        if (!touch.holdFired && now - touch.downMs >= ADMIN_HOLD_MS) {
+            touch.hold = true;
+            touch.holdFired = true;
+        }
+    } else if (touch.down) {                     // release edge
+        touch.down = false;
+        btnDirty = true;
+        int16_t dx = touch.x - touch.downX;
+        int16_t dy = touch.y - touch.downY;
+        unsigned long held = now - touch.downMs;
+
+        if (touch.holdFired) {
+            // already delivered as a hold; a tap would double-fire the action
+        } else if (abs(dy) > 60 && abs(dx) < 45) {
+            touch.swipe = (dy > 0) ? 1 : -1;
+        } else if (held >= TAP_MIN_MS &&
+                   abs(dx) <= TAP_MAX_DRIFT && abs(dy) <= TAP_MAX_DRIFT) {
+            touch.tap  = true;
+            touch.tapX = touch.downX;
+            touch.tapY = touch.downY;
+        }
     }
-    b.lastState = state;
 }
 
-void readAllButtons() {
-    readButton(btnUp);
-    readButton(btnDown);
-    readButton(btnHash);
-    readButton(btnStar);
+// ───────── Touch button registry ─────────
+// draw*Screen() declares its targets; the same rectangles are hit-tested, so
+// the drawn button and the tappable area cannot drift apart.
+enum BtnId {
+    B_NONE = 0,
+    B_START, B_HISTORY, B_BACK, B_OK, B_PAUSE, B_RESUME, B_FINISH,
+    B_PREV, B_NEXT, B_SAVE, B_CANCEL, B_EXIT, B_EDIT,
+    B_BRIGHT_DN, B_BRIGHT_UP,
+    B_DEC_BIG, B_DEC, B_INC, B_INC_BIG,
+    B_SCROLL_UP, B_SCROLL_DN,
+    B_ROW0, B_ROW1, B_ROW2, B_ROW3, B_ROW4, B_ROW5, B_ROW6, B_ROW7, B_ROW8,
+    B_KEY0, B_KEY1, B_KEY2, B_KEY3, B_KEY4,
+    B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9,
+    B_KEYDEL, B_KEYESC,
+};
+
+struct Btn {
+    uint8_t  id;
+    int16_t  x, y, w, h;
+    const char* label;
+    uint16_t color;
+    bool     flat;      // list row: no rounded frame, highlight when selected
+    bool     selected;
+};
+#define MAX_BTNS 16
+Btn  curBtns[MAX_BTNS];
+int  curBtnCount = 0;
+
+void beginBtns() { curBtnCount = 0; }
+
+void addBtn(uint8_t id, int16_t x, int16_t y, int16_t w, int16_t h,
+            const char* label, uint16_t color, bool flat = false,
+            bool selected = false) {
+    if (curBtnCount >= MAX_BTNS) return;
+    curBtns[curBtnCount++] = {id, x, y, w, h, label, color, flat, selected};
 }
 
-bool uiDirty = false;   // set on any consumed key press -> full redraw next refresh
-
-bool consume(Button &b) {
-    if (b.pressed) { b.pressed = false; uiDirty = true; return true; }
-    return false;
+// Bottom action bar: `n` equal buttons across the full width.
+void addBarBtn(uint8_t id, int idx, int n, const char* label, uint16_t color) {
+    int16_t w = (TFT_WIDTH - UI_MARGIN * 2 - UI_MARGIN * (n - 1)) / n;
+    addBtn(id, UI_MARGIN + idx * (w + UI_MARGIN), BTN_Y, w, BTN_H, label, color);
 }
 
-// ───────── Speaker ─────────
+void drawBtn(const Btn& b, bool pressed) {
+    if (b.flat) {
+        uint16_t bg = pressed ? COL_HEADER_BG : (b.selected ? COL_BTN_BG : COL_BG);
+        tft.fillRect(b.x, b.y, b.w, b.h, bg);
+        if (b.selected) tft.drawRect(b.x, b.y, b.w, b.h, b.color);
+        return;   // the caller paints the row contents
+    }
+    uint16_t bg = pressed ? b.color   : COL_BTN_BG;
+    uint16_t fg = pressed ? COL_BG    : b.color;
+    tft.fillRoundRect(b.x, b.y, b.w, b.h, 6, bg);
+    tft.drawRoundRect(b.x, b.y, b.w, b.h, 6, b.color);
+    if (!b.label || !b.label[0]) return;
+
+    uint8_t size = (b.h >= 40) ? 2 : 1;
+    int16_t tw = (int16_t)strlen(b.label) * 6 * size;
+    if (tw > b.w - 6 && size > 1) { size = 1; tw = (int16_t)strlen(b.label) * 6; }
+    tft.setTextSize(size);
+    tft.setTextColor(fg, bg);
+    tft.setCursor(b.x + (b.w - tw) / 2, b.y + (b.h - 8 * size) / 2);
+    tft.print(b.label);
+}
+
+bool btnIsPressed(const Btn& b) {
+    return touch.down &&
+           touch.x >= b.x && touch.x < b.x + b.w &&
+           touch.y >= b.y && touch.y < b.y + b.h;
+}
+
+void drawAllBtns() {
+    for (int i = 0; i < curBtnCount; i++)
+        if (!curBtns[i].flat) drawBtn(curBtns[i], btnIsPressed(curBtns[i]));
+}
+
+// Consumes the pending tap and reports which button it landed on.
+uint8_t tappedBtn() {
+    if (!touch.tap) return B_NONE;
+    for (int i = 0; i < curBtnCount; i++) {
+        const Btn& b = curBtns[i];
+        if (touch.tapX >= b.x && touch.tapX < b.x + b.w &&
+            touch.tapY >= b.y && touch.tapY < b.y + b.h) {
+            touch.tap = false;
+            uiDirty = true;
+            return b.id;
+        }
+    }
+    touch.tap = false;   // tap landed on dead space
+    return B_NONE;
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+//  Audio — on-board PCM5101 I2S DAC
+// ═══════════════════════════════════════════════════════════════════════
+static bool audioReady = false;
+
+void initAudio() {
+    i2s_config_t cfg = {};
+    cfg.mode                = (i2s_mode_t)(I2S_MODE_MASTER | I2S_MODE_TX);
+    cfg.sample_rate         = I2S_SAMPLE_RATE;
+    cfg.bits_per_sample     = I2S_BITS_PER_SAMPLE_16BIT;
+    cfg.channel_format      = I2S_CHANNEL_FMT_RIGHT_LEFT;
+    cfg.communication_format = I2S_COMM_FORMAT_STAND_I2S;
+    cfg.intr_alloc_flags    = ESP_INTR_FLAG_LEVEL1;
+    cfg.dma_buf_count       = 4;
+    cfg.dma_buf_len         = 256;
+    cfg.use_apll            = false;
+    cfg.tx_desc_auto_clear  = true;
+    cfg.fixed_mclk          = 0;
+
+    i2s_pin_config_t pins = {};
+    pins.mck_io_num   = I2S_PIN_NO_CHANGE;
+    pins.bck_io_num   = I2S_BCLK;
+    pins.ws_io_num    = I2S_LRCK;
+    pins.data_out_num = I2S_DOUT;
+    pins.data_in_num  = I2S_PIN_NO_CHANGE;
+
+    if (i2s_driver_install(I2S_NUM_0, &cfg, 0, NULL) != ESP_OK) return;
+    if (i2s_set_pin(I2S_NUM_0, &pins) != ESP_OK) return;
+    i2s_zero_dma_buffer(I2S_NUM_0);
+    audioReady = true;
+}
+
+// Blocking, like the PWM tone() it replaces — callers rely on that.
+// A 4 ms attack/release ramp keeps the amplifier from clicking on each beep.
 void playTone(uint16_t freq, uint16_t durationMs) {
-    ledcWriteTone(1, freq);
-    delay(durationMs);
-    ledcWriteTone(1, 0);
+    if (!audioReady || freq == 0 || durationMs == 0) return;
+
+    const uint32_t total   = (uint32_t)I2S_SAMPLE_RATE * durationMs / 1000;
+    const uint32_t rampMax = (uint32_t)I2S_SAMPLE_RATE * 4 / 1000;   // 4 ms
+    const uint32_t ramp    = (rampMax < total / 2) ? rampMax : total / 2;
+    const float    step    = 2.0f * PI * freq / I2S_SAMPLE_RATE;
+    const float    peak    = 32767.0f * TONE_VOLUME;
+
+    static int16_t frames[128 * 2];
+    float phase = 0;
+    uint32_t done = 0;
+    while (done < total) {
+        uint32_t n = (total - done < 128) ? (total - done) : 128;
+        for (uint32_t i = 0; i < n; i++) {
+            uint32_t pos = done + i;
+            float env = 1.0f;
+            if (ramp > 0) {
+                if (pos < ramp)               env = (float)pos / ramp;
+                else if (total - pos < ramp)  env = (float)(total - pos) / ramp;
+            }
+            int16_t s = (int16_t)(peak * env * sinf(phase));
+            phase += step;
+            if (phase > 2.0f * PI) phase -= 2.0f * PI;
+            frames[i * 2] = s; frames[i * 2 + 1] = s;
+        }
+        size_t written = 0;
+        i2s_write(I2S_NUM_0, frames, n * 2 * sizeof(int16_t), &written, portMAX_DELAY);
+        done += n;
+    }
+    i2s_zero_dma_buffer(I2S_NUM_0);
 }
 
 void beep() {
@@ -458,9 +727,7 @@ void beep() {
 
 // ───────── Backlight ─────────
 void setBacklight(uint8_t val) {
-    if (TFT_BL >= 0) {
-        ledcWrite(0, val);
-    }
+    ledcWrite(0, val);
 }
 
 // ───────── Sensor Reading ─────────
@@ -499,9 +766,10 @@ void readSensor() {
     }
 }
 
-int getSensorRaw() { return analogRead(LDR_SIGNAL_PIN); }
 const char* getSensorLabel() { return "LDR"; }
-int getSensorThreshold() { return LDR_THRESHOLD; }
+void getSensorText(char* buf, size_t n) {
+    snprintf(buf, n, "LDR %-4d (thr %d)", analogRead(LDR_SIGNAL_PIN), LDR_THRESHOLD);
+}
 #endif
 
 #ifdef SENSOR_TYPE_HALL
@@ -530,9 +798,10 @@ void readSensor() {
     }
 }
 
-int getSensorRaw() { return digitalRead(HALL_SENSOR_PIN) == LOW ? 0 : 4095; }
 const char* getSensorLabel() { return "HALL"; }
-int getSensorThreshold() { return 0; }
+void getSensorText(char* buf, size_t n) {
+    snprintf(buf, n, "HALL: %-7s", digitalRead(HALL_SENSOR_PIN) == LOW ? "MAGNET" : "clear");
+}
 #endif
 
 #ifdef SENSOR_TYPE_BLOCKER
@@ -561,9 +830,11 @@ void readSensor() {
     }
 }
 
-int getSensorRaw() { return digitalRead(BLOCKER_SENSOR_PIN) == LOW ? 0 : 4095; }
 const char* getSensorLabel() { return "BLKR"; }
-int getSensorThreshold() { return 0; }
+void getSensorText(char* buf, size_t n) {
+    bool blocked = (digitalRead(BLOCKER_SENSOR_PIN) == LOW) == BLOCKER_ACTIVE_LOW;
+    snprintf(buf, n, "SENSOR: %-8s", blocked ? "BLOCKED" : "clear");
+}
 #endif
 
 // ───────── BLE FTMS Setup & Update ─────────
@@ -773,97 +1044,147 @@ bool uploadToNAS(uint32_t durSec) {
 }
 
 // ───────── Drawing Helpers ─────────
+
+// Adafruit_GFX has no scaled bitmap blit; the 16x16 icons would be ~3 mm on a
+// 2.8" panel, so set pixels are expanded into scale x scale blocks.
+void drawIcon(int16_t x, int16_t y, const uint8_t* bmp, uint16_t color, uint8_t scale) {
+    for (int16_t j = 0; j < 16; j++) {
+        uint16_t row = (pgm_read_byte(&bmp[j * 2]) << 8) | pgm_read_byte(&bmp[j * 2 + 1]);
+        int16_t runStart = -1;
+        for (int16_t i = 0; i <= 16; i++) {
+            bool on = (i < 16) && (row & (0x8000 >> i));
+            if (on && runStart < 0) runStart = i;
+            if (!on && runStart >= 0) {           // flush the horizontal run
+                tft.fillRect(x + runStart * scale, y + j * scale,
+                             (i - runStart) * scale, scale, color);
+                runStart = -1;
+            }
+        }
+    }
+}
+
 void drawHeader(const char* title) {
-    tft.fillRect(0, 0, TFT_WIDTH, 18, COL_HEADER_BG);
-    tft.setTextSize(1);
+    tft.fillRect(0, 0, TFT_WIDTH, HEADER_H, COL_HEADER_BG);
+    tft.setTextSize(2);
     tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
-    tft.setCursor(4, 5);
+    tft.setCursor(8, (HEADER_H - 16) / 2);
     tft.print(title);
     // BLE indicator
-    tft.setCursor(TFT_WIDTH - 36, 5);
+    tft.setTextSize(1);
+    tft.setCursor(TFT_WIDTH - 52, (HEADER_H - 8) / 2);
     tft.setTextColor(bleClientConnected ? COL_VALUE : COL_LABEL, COL_HEADER_BG);
     tft.print(bleClientConnected ? "BT" : "bt");
     // WiFi indicator
-    tft.setCursor(TFT_WIDTH - 16, 5);
+    tft.setCursor(TFT_WIDTH - 28, (HEADER_H - 8) / 2);
     tft.setTextColor(WiFi.status() == WL_CONNECTED ? COL_VALUE : COL_ERROR, COL_HEADER_BG);
     tft.print(WiFi.status() == WL_CONNECTED ? "W+" : "W-");
 }
 
 void drawDivider(int y) {
-    tft.drawFastHLine(4, y, TFT_WIDTH - 8, COL_DIVIDER);
+    tft.drawFastHLine(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, COL_DIVIDER);
 }
 
-void drawLabelValue(int x, int y, const char* label, const char* value, uint16_t valColor = COL_VALUE) {
+// Small caps label with a big value underneath.
+void drawLabelValue(int x, int y, const char* label, const char* value,
+                    uint16_t valColor = COL_VALUE, uint8_t valSize = 3) {
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
     tft.setCursor(x, y);
     tft.print(label);
     tft.setTextColor(valColor, COL_BG);
-    tft.setCursor(x, y + 12);
-    tft.setTextSize(2);
+    tft.setCursor(x, y + 14);
+    tft.setTextSize(valSize);
     tft.print(value);
 }
 
-void drawKeyHints(const char* up, const char* down, const char* hash, const char* star) {
-    int y = TFT_HEIGHT - 11;
-    tft.fillRect(0, y - 2, TFT_WIDTH, 13, COL_HEADER_BG);
+void drawCentered(int16_t y, const char* text, uint8_t size, uint16_t color) {
+    int16_t w = (int16_t)strlen(text) * 6 * size;
+    tft.setTextSize(size);
+    tft.setTextColor(color, COL_BG);
+    tft.setCursor((TFT_WIDTH - w) / 2, y);
+    tft.print(text);
+}
+
+// Word-wrapped single-line-height text, clipped to `lines` rows.
+void drawWrapped(int16_t x, int16_t y, int16_t w, const char* text, uint16_t color, int lines) {
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_HEADER_BG);  // text bg must match the bar
-    if (up && up[0])   { tft.setCursor(2, y);   tft.printf("\x18%s", up); }
-    if (down && down[0]){ tft.setCursor(36, y);  tft.printf("\x19%s", down); }
-    if (hash && hash[0]){ tft.setCursor(68, y);  tft.printf("#%s", hash); }
-    if (star && star[0]){ tft.setCursor(100, y); tft.printf("*%s", star); }
+    tft.setTextColor(color, COL_BG);
+    int maxChars = w / 6;
+    int len = strlen(text), pos = 0, row = 0;
+    while (pos < len && row < lines) {
+        int take = min(maxChars, len - pos);
+        if (pos + take < len) {                   // break on the last space
+            int brk = take;
+            while (brk > 0 && text[pos + brk] != ' ') brk--;
+            if (brk > 0) take = brk;
+        }
+        tft.setCursor(x, y + row * 10);
+        for (int i = 0; i < take; i++) tft.print(text[pos + i]);
+        pos += take;
+        while (pos < len && text[pos] == ' ') pos++;
+        row++;
+    }
 }
 
 // ───────── Screens ─────────
+
 void drawIdleScreen() {
+    char buf[40];
 
     drawHeader("WATER ROWER");
 
-    // Rowing person icon
-    tft.drawBitmap(8, 22, bmp_rower, 16, 16, COL_ACCENT);
-    // Water waves
-    tft.drawBitmap(28, 28, bmp_wave, 16, 16, BLUE);
-    tft.drawBitmap(48, 28, bmp_wave, 16, 16, BLUE);
-    tft.drawBitmap(68, 28, bmp_wave, 16, 16, BLUE);
-    tft.drawBitmap(88, 28, bmp_wave, 16, 16, BLUE);
-    tft.drawBitmap(108, 28, bmp_wave, 16, 16, BLUE);
+    drawIcon(UI_MARGIN, CONTENT_Y + 4, bmp_rower, COL_ACCENT, 2);
+    for (int i = 0; i < 5; i++)
+        drawIcon(48 + i * 34, CONTENT_Y + 12, bmp_wave, BLUE, 2);
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(30, 22);
-    tft.print(MACHINE_SN);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 42);
+    tft.printf("%s  SN %s", MACHINE_MODEL, MACHINE_SN);
 
-    drawDivider(48);
+    drawDivider(CONTENT_Y + 56);
 
-    // Sensor value
-    int sensorVal = getSensorRaw();
-    tft.setCursor(4, 52);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setTextSize(1);
-    tft.printf("%s: %-4d", getSensorLabel(), sensorVal);  // pad: erase stale digits
-
-    tft.setCursor(4, 66);
-    tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.setTextSize(2);
-    tft.print("READY");
-
-    // Random funny idle message (messages differ in length/lines: clear area first)
-    tft.fillRect(0, 88, TFT_WIDTH, 16, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(4, 88);
-    tft.print(idle_msgs[millis() / 3000 % NUM_IDLE_MSGS]);
-
+    getSensorText(buf, sizeof(buf));
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 108);
-    tft.print("* START  # HISTORY");
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 64);
+    tft.print(buf);
 
-    drawKeyHints("BRT+", "BRT-", "HIST", "GO");
+    drawCentered(CONTENT_Y + 80, "READY", 4, COL_ACCENT);
+
+    // Rotating idle message (lengths differ: clear the block first)
+    tft.fillRect(0, CONTENT_Y + 120, TFT_WIDTH, 22, COL_BG);
+    drawWrapped(UI_MARGIN, CONTENT_Y + 120, TFT_WIDTH - UI_MARGIN * 2,
+                idle_msgs[millis() / 3000 % NUM_IDLE_MSGS], COL_WARN, 2);
+
+    // Brightness row
+    int16_t by = CONTENT_Y + 150;
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, by);
+    tft.print("BRIGHTNESS");
+
+    int16_t bary = by + 14, barx = UI_MARGIN + 52, barw = TFT_WIDTH - barx - 52 - UI_MARGIN;
+    tft.drawRect(barx, bary + 8, barw, 12, COL_DIVIDER);
+    tft.fillRect(barx + 1, bary + 9, (barw - 2) * brightness / 255, 10, COL_ACCENT);
+    tft.fillRect(barx + 1 + (barw - 2) * brightness / 255, bary + 9,
+                 (barw - 2) - (barw - 2) * brightness / 255, 10, COL_BG);
+
+    beginBtns();
+    addBtn(B_BRIGHT_DN, UI_MARGIN, bary, 44, 28, "-", COL_LABEL);
+    addBtn(B_BRIGHT_UP, TFT_WIDTH - UI_MARGIN - 44, bary, 44, 28, "+", COL_LABEL);
+    addBarBtn(B_HISTORY, 0, 2, "HISTORY", COL_LABEL);
+    addBarBtn(B_START,   1, 2, "START",   COL_VALUE);
+    drawAllBtns();
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_DIVIDER, COL_BG);
+    tft.setCursor(UI_MARGIN, BAR_Y - 14);
+    tft.print("Hold the title bar 3s for admin");
 }
 
 void drawWorkoutScreen() {
+    char buf[24];
 
     drawHeader("ROWING");
 
@@ -873,451 +1194,483 @@ void drawWorkoutScreen() {
     uint32_t s  = sec % 60;
 
     // Animated rower icon (alternates position)
-    tft.fillRect(4, 21, 24, 16, COL_BG);
-    int rowerX = 4 + (millis() / 400 % 3) * 2;
-    tft.drawBitmap(rowerX, 21, bmp_rower, 16, 16, COL_ACCENT);
+    tft.fillRect(UI_MARGIN, CONTENT_Y + 2, 44, 32, COL_BG);
+    int rowerX = UI_MARGIN + (millis() / 400 % 3) * 4;
+    drawIcon(rowerX, CONTENT_Y + 2, bmp_rower, COL_ACCENT, 2);
 
-    char timeBuf[16];
-    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mn, s);
-    tft.setTextSize(2);
+    snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)mn, (unsigned long)s);
+    tft.setTextSize(4);
     tft.setTextColor(COL_TEXT, COL_BG);
-    tft.setCursor(30, 24);
-    tft.print(timeBuf);
+    tft.setCursor(72, CONTENT_Y + 2);
+    tft.print(buf);
 
-    drawDivider(42);
+    drawDivider(CONTENT_Y + 36);
 
-    // Distance with fire icon when going fast
-    char distBuf[16];
-    snprintf(distBuf, sizeof(distBuf), "%7.1f", totalMeters);
-    drawLabelValue(4, 46, "DISTANCE (m)", distBuf);
+    snprintf(buf, sizeof(buf), "%7.1f", totalMeters);
+    drawLabelValue(UI_MARGIN, CONTENT_Y + 42, "DISTANCE (m)", buf, COL_VALUE, 4);
 
-    tft.fillRect(108, 46, 16, 16, COL_BG);
-    if (currentSpeed > 2.5f) {
-        tft.drawBitmap(108, 46, bmp_fire, 16, 16, ST77XX_RED);
-    }
+    // Fire icon when moving fast
+    tft.fillRect(TFT_WIDTH - 40, CONTENT_Y + 56, 32, 32, COL_BG);
+    if (currentSpeed > 2.5f)
+        drawIcon(TFT_WIDTH - 40, CONTENT_Y + 56, bmp_fire, ST77XX_RED, 2);
 
-    char splitBuf[16];
     if (currentSpeed > 0.1f) {
         float secPer500 = 500.0f / currentSpeed;
-        int sp_min = (int)(secPer500 / 60);
-        int sp_sec = (int)secPer500 % 60;
-        snprintf(splitBuf, sizeof(splitBuf), "%2d:%02d", sp_min, sp_sec);  // fixed 5 chars: no residue
+        snprintf(buf, sizeof(buf), "%2d:%02d", (int)(secPer500 / 60), (int)secPer500 % 60);
     } else {
-        snprintf(splitBuf, sizeof(splitBuf), "--:--");
+        snprintf(buf, sizeof(buf), "--:--");
     }
-    drawLabelValue(4, 80, "/500m SPLIT", splitBuf, COL_ACCENT);
+    drawLabelValue(UI_MARGIN, CONTENT_Y + 94, "/500m SPLIT", buf, COL_ACCENT, 4);
 
-    // Motivational message (changes every 10 seconds)
-    drawDivider(103);
-    tft.fillRect(0, 105, TFT_WIDTH, 9, COL_BG);
-    tft.setTextSize(1);
-    tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(4, 106);
-    tft.print(fun_msgs[(sec / 10) % NUM_FUN_MSGS]);
+    drawDivider(CONTENT_Y + 146);
 
     // SPM | STROKES | CAL
+    const int16_t colX[3] = {UI_MARGIN, 88, 168};
+    const char* colLbl[3] = {"SPM", "STROKES", "CAL"};
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4,  118); tft.print("SPM");
-    tft.setCursor(48, 118); tft.print("STR");
-    tft.setCursor(92, 118); tft.print("CAL");
-    tft.setTextSize(2);
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(4,  130); tft.printf("%-3.0f", strokeRate);
-    tft.setCursor(48, 130); tft.printf("%-4lu", (unsigned long)strokeCount);
-    tft.setCursor(92, 130); tft.printf("%-3.0f", totalCalories);
-
-    // Animated water at bottom
-    tft.fillRect(0, 148, TFT_WIDTH, 16, COL_BG);
-    int waveOffset = (millis() / 300) % 16;
-    for (int x = waveOffset - 16; x < 128; x += 16) {
-        tft.drawBitmap(x, 148, bmp_wave, 16, 16, BLUE);
+    for (int i = 0; i < 3; i++) {
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setCursor(colX[i], CONTENT_Y + 152);
+        tft.print(colLbl[i]);
     }
+    tft.setTextSize(3);
+    tft.setTextColor(COL_VALUE, COL_BG);
+    tft.setCursor(colX[0], CONTENT_Y + 164); tft.printf("%-3.0f", strokeRate);
+    tft.setCursor(colX[1], CONTENT_Y + 164); tft.printf("%-4lu", (unsigned long)strokeCount);
+    tft.setCursor(colX[2], CONTENT_Y + 164); tft.printf("%-3.0f", totalCalories);
 
-    drawKeyHints("", "", "STOP", "");
+    // Motivational message (changes every 10 seconds)
+    tft.fillRect(0, BAR_Y - 32, TFT_WIDTH, 10, COL_BG);
+    tft.setTextSize(1);
+    tft.setTextColor(COL_WARN, COL_BG);
+    tft.setCursor(UI_MARGIN, BAR_Y - 32);
+    tft.print(fun_msgs[(sec / 10) % NUM_FUN_MSGS]);
+
+    // Animated water above the action bar
+    tft.fillRect(0, BAR_Y - 18, TFT_WIDTH, 16, COL_BG);
+    int waveOffset = (millis() / 300) % 16;
+    for (int x = waveOffset - 16; x < TFT_WIDTH; x += 16)
+        drawIcon(x, BAR_Y - 18, bmp_wave, BLUE, 1);
+
+    beginBtns();
+    addBarBtn(B_PAUSE, 0, 1, "PAUSE", COL_WARN);
+    drawAllBtns();
 }
 
 void drawPausedScreen() {
+    char buf[24];
 
     drawHeader("PAUSED");
 
     uint32_t sec = workoutElapsedMs / 1000;
-    uint32_t mn = sec / 60;
-    uint32_t s  = sec % 60;
 
-    // Skull icon - "are you dying?"
-    tft.drawBitmap(4, 24, bmp_skull, 16, 16, COL_WARN);
+    drawIcon(UI_MARGIN, CONTENT_Y + 4, bmp_skull, COL_WARN, 2);
 
-    tft.setTextSize(2);
+    tft.setTextSize(3);
     tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(28, 28);
+    tft.setCursor(52, CONTENT_Y + 4);
     tft.print("PAUSED");
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(28, 43);
+    tft.setCursor(52, CONTENT_Y + 30);
     tft.print("Tired already?");
 
-    char timeBuf[16];
-    snprintf(timeBuf, sizeof(timeBuf), "%02d:%02d", mn, s);
-    tft.setTextSize(2);
+    snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+    tft.setTextSize(4);
     tft.setTextColor(COL_TEXT, COL_BG);
-    tft.setCursor(30, 58);
-    tft.print(timeBuf);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 50);
+    tft.print(buf);
 
-    drawDivider(78);
+    drawDivider(CONTENT_Y + 92);
 
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 82);   tft.printf("Dist: %.1f m", totalMeters);
-    tft.setCursor(4, 94);   tft.printf("Strokes: %d", strokeCount);
-    tft.setCursor(4, 106);  tft.printf("Cal: %.0f", totalCalories);
-    tft.setCursor(4, 118);  tft.printf("Drag k: %.4f", kEff);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 102);  tft.printf("Dist %.1f m ", totalMeters);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 124);  tft.printf("Strokes %lu ", (unsigned long)strokeCount);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 146);  tft.printf("Cal %.0f ", totalCalories);
+    tft.setTextSize(1);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 172);  tft.printf("Drag k: %.4f", kEff);
 
-    // Motivational nudge
     tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.setCursor(4, 130);
-    tft.print("* = Get back in there!");
+    tft.setCursor(UI_MARGIN, BAR_Y - 16);
+    tft.print("RESUME = get back in there!");
 
-    drawKeyHints("", "", "SAVE", "GO!");
+    beginBtns();
+    addBarBtn(B_FINISH, 0, 2, "FINISH", COL_ERROR);
+    addBarBtn(B_RESUME, 1, 2, "RESUME", COL_VALUE);
+    drawAllBtns();
 }
 
 void drawSummaryScreen(bool uploadOk) {
+    char buf[32];
 
     tft.fillScreen(COL_BG);
     drawHeader("SUMMARY");
 
-    // Trophy icon
-    tft.drawBitmap(4, 22, bmp_trophy, 16, 16, COL_WARN);
+    drawIcon(UI_MARGIN, CONTENT_Y + 4, bmp_trophy, COL_WARN, 2);
 
     uint32_t sec = workoutElapsedMs / 1000;
-    uint32_t mn = sec / 60;
-    uint32_t s  = sec % 60;
-    char buf[32];
 
-    snprintf(buf, sizeof(buf), "%02d:%02d", mn, s);
-    drawLabelValue(24, 22, "TIME", buf, COL_TEXT);
+    snprintf(buf, sizeof(buf), "%02lu:%02lu", (unsigned long)(sec / 60), (unsigned long)(sec % 60));
+    drawLabelValue(52, CONTENT_Y + 4, "TIME", buf, COL_TEXT, 4);
 
     snprintf(buf, sizeof(buf), "%.1f", totalMeters);
-    drawLabelValue(4, 52, "DISTANCE (m)", buf);
+    drawLabelValue(UI_MARGIN, CONTENT_Y + 56, "DISTANCE (m)", buf, COL_VALUE, 4);
 
-    snprintf(buf, sizeof(buf), "%d", strokeCount);
-    drawLabelValue(4, 82, "STROKES", buf, COL_ACCENT);
+    snprintf(buf, sizeof(buf), "%lu", (unsigned long)strokeCount);
+    drawLabelValue(UI_MARGIN, CONTENT_Y + 112, "STROKES", buf, COL_ACCENT, 3);
 
     snprintf(buf, sizeof(buf), "%.0f", totalCalories);
-    drawLabelValue(68, 82, "CAL", buf, COL_WARN);
+    drawLabelValue(130, CONTENT_Y + 112, "CALORIES", buf, COL_WARN, 3);
 
-    drawDivider(108);
+    drawDivider(CONTENT_Y + 156);
 
-    // Funny completion message
     tft.setTextSize(1);
     tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(4, 112);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 164);
     tft.print(done_msgs[sec % NUM_DONE_MSGS]);
 
-    // Upload status with emoji
-    tft.setCursor(4, 126);
+    // Upload status
+    int16_t sy = CONTENT_Y + 182;
     if (currentUser == USER_COUNT) {
-        tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_WARN);
+        drawIcon(UI_MARGIN, sy, bmp_happy, COL_WARN, 2);
         tft.setTextColor(COL_WARN, COL_BG);
-        tft.setCursor(24, 128);
-        tft.print("Guest - BT only");
     } else if (uploadOk) {
-        tft.drawBitmap(4, 124, bmp_happy, 16, 16, COL_VALUE);
+        drawIcon(UI_MARGIN, sy, bmp_happy, COL_VALUE, 2);
         tft.setTextColor(COL_VALUE, COL_BG);
-        tft.setCursor(24, 128);
-        tft.print("Saved to NAS!");
     } else {
-        tft.drawBitmap(4, 124, bmp_sad, 16, 16, COL_ERROR);
+        drawIcon(UI_MARGIN, sy, bmp_sad, COL_ERROR, 2);
         tft.setTextColor(COL_ERROR, COL_BG);
-        tft.setCursor(24, 128);
-        tft.print("Upload FAILED");
     }
+    tft.setTextSize(2);
+    tft.setCursor(48, sy + 8);
+    tft.print(currentUser == USER_COUNT ? "Guest: BT only"
+              : uploadOk ? "Saved to NAS!" : "Upload FAILED");
 
-    drawKeyHints("", "", "BACK", "");
+    beginBtns();
+    addBarBtn(B_OK, 0, 1, "DONE", COL_ACCENT);
+    drawAllBtns();
 }
 
 void drawHistoryScreen() {
+    char buf[32];
 
     drawHeader("HISTORY");
 
+    beginBtns();
     if (historyCount == 0) {
-        tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setCursor(20, 60);
-        tft.print("No records yet");
+        drawCentered(CONTENT_Y + 80, "No records yet", 2, COL_LABEL);
     } else {
         int idx = displayPage;
         if (idx >= historyCount) idx = historyCount - 1;
         WorkoutRecord &r = history[idx];
 
-        tft.setTextSize(1);
+        tft.setTextSize(2);
         tft.setTextColor(COL_ACCENT, COL_BG);
-        tft.setCursor(4, 24);
-        tft.printf("Record %d/%d", idx + 1, historyCount);
+        tft.setCursor(UI_MARGIN, CONTENT_Y + 4);
+        tft.printf("Record %d/%d ", idx + 1, historyCount);
+
+        tft.setTextSize(1);
         tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setCursor(4, 38);
+        tft.setCursor(UI_MARGIN, CONTENT_Y + 26);
         tft.print(r.date);
 
-        char buf[32];
-        uint32_t mn = r.durationSec / 60;
-        uint32_t s = r.durationSec % 60;
-        snprintf(buf, sizeof(buf), "%02d:%02d", mn, s);
-        drawLabelValue(4, 54, "TIME", buf, COL_TEXT);
+        drawDivider(CONTENT_Y + 40);
+
+        snprintf(buf, sizeof(buf), "%02lu:%02lu",
+                 (unsigned long)(r.durationSec / 60), (unsigned long)(r.durationSec % 60));
+        drawLabelValue(UI_MARGIN, CONTENT_Y + 48, "TIME", buf, COL_TEXT, 4);
 
         snprintf(buf, sizeof(buf), "%.0f", r.distance);
-        drawLabelValue(4, 84, "DIST(m)", buf);
+        drawLabelValue(UI_MARGIN, CONTENT_Y + 104, "DISTANCE (m)", buf, COL_VALUE, 4);
 
-        snprintf(buf, sizeof(buf), "%d", r.strokes);
-        drawLabelValue(68, 84, "STR", buf, COL_ACCENT);
+        snprintf(buf, sizeof(buf), "%lu", (unsigned long)r.strokes);
+        drawLabelValue(UI_MARGIN, CONTENT_Y + 160, "STROKES", buf, COL_ACCENT, 2);
 
-        tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setCursor(4, 118);
-        tft.printf("Cal: %.0f", r.calories);
+        snprintf(buf, sizeof(buf), "%.0f", r.calories);
+        drawLabelValue(130, CONTENT_Y + 160, "CALORIES", buf, COL_WARN, 2);
+
+        addBarBtn(B_PREV, 0, 3, "PREV", displayPage > 0 ? COL_ACCENT : COL_DIVIDER);
+        addBarBtn(B_BACK, 1, 3, "BACK", COL_LABEL);
+        addBarBtn(B_NEXT, 2, 3, "NEXT",
+                  displayPage < historyCount - 1 ? COL_ACCENT : COL_DIVIDER);
+        drawAllBtns();
+        return;
     }
-
-    drawKeyHints("PREV", "NEXT", "BACK", "");
+    addBarBtn(B_BACK, 0, 1, "BACK", COL_LABEL);
+    drawAllBtns();
 }
 
 void drawUploadingScreen() {
-
     tft.fillScreen(COL_BG);   // called directly from loop(), must clear itself
     drawHeader("SAVING...");
 
-    // Animated dots loading effect
-    tft.drawBitmap(56, 35, bmp_happy, 16, 16, COL_WARN);
+    drawIcon((TFT_WIDTH - 32) / 2, CONTENT_Y + 30, bmp_happy, COL_WARN, 2);
 
-    tft.setTextSize(2);
-    tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(10, 60);
-    tft.print("Uploading");
+    drawCentered(CONTENT_Y + 80, "Uploading", 3, COL_WARN);
+    drawCentered(CONTENT_Y + 120, "Sending to NAS...", 1, COL_LABEL);
+    drawCentered(CONTENT_Y + 136, "Don't pull the plug!", 1, COL_LABEL);
 
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(10, 85);
-    tft.print("Sending to NAS...");
-    tft.setCursor(10, 100);
-    tft.print("Don't pull the plug!");
+    for (int x = 0; x < TFT_WIDTH; x += 32)
+        drawIcon(x, TFT_HEIGHT - 48, bmp_wave, BLUE, 2);
 
-    // Wave animation at bottom
-    for (int x = 0; x < 128; x += 16) {
-        tft.drawBitmap(x, 140, bmp_wave, 16, 16, BLUE);
+    beginBtns();   // no touch targets while uploading
+}
+
+// Shared scrolling list: `total` rows, `sel` highlighted, drawn from `scroll`.
+// The row body is painted by the caller through a callback-free convention:
+// this only draws the selection frame and registers B_ROW0.. hit targets.
+#define LIST_ROW_H  42
+int listVisibleRows() { return (BAR_Y - CONTENT_Y - 4) / LIST_ROW_H; }
+
+int16_t listRowY(int row) { return CONTENT_Y + 4 + row * LIST_ROW_H; }
+
+void drawUserSelectScreen() {
+    drawHeader("WHO ARE YOU?");
+
+    int total = USER_COUNT + 1;                 // +1 for Guest
+    int vis   = min(listVisibleRows(), total);
+    if (currentUser < userScrollOffset) userScrollOffset = currentUser;
+    if (currentUser >= userScrollOffset + vis) userScrollOffset = currentUser - vis + 1;
+
+    beginBtns();
+    for (int row = 0; row < vis; row++) {
+        int i = userScrollOffset + row;
+        if (i >= total) break;
+        bool isGuest = (i == USER_COUNT);
+        const char* name = isGuest ? "Guest" : userNames[i];
+        int16_t y = listRowY(row);
+        bool sel = (i == currentUser);
+
+        uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
+        tft.fillRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, rowBg);
+        if (sel) tft.drawRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, COL_ACCENT);
+
+        tft.setTextSize(2);
+        tft.setTextColor(isGuest ? COL_WARN : (sel ? COL_ACCENT : COL_LABEL), rowBg);
+        tft.setCursor(UI_MARGIN + 12, y + (LIST_ROW_H - 4 - 16) / 2);
+        tft.print(name);
+
+        if (!isGuest) {
+            tft.setTextSize(1);
+            tft.setTextColor(COL_DIVIDER, rowBg);
+            tft.setCursor(TFT_WIDTH - UI_MARGIN - 34, y + (LIST_ROW_H - 4 - 8) / 2);
+            tft.printf("%d/%d", i + 1, USER_COUNT);
+        }
+        addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
+               nullptr, COL_ACCENT, true, sel);
     }
+
+    if (total > vis) {
+        tft.setTextSize(1);
+        tft.setTextColor(COL_LABEL, COL_BG);
+        tft.setCursor(TFT_WIDTH / 2 - 30, BAR_Y - 12);
+        tft.print("swipe to scroll");
+    }
+
+    addBarBtn(B_BACK,  0, 2, "BACK",  COL_LABEL);
+    addBarBtn(B_START, 1, 2, "START", COL_VALUE);
+    drawAllBtns();
 }
 
 void drawAdminMenuScreen() {
-
     drawHeader("ADMIN MENU");
 
-    tft.drawBitmap(56, 20, bmp_trophy, 16, 16, COL_WARN);
+    static const char* const items[ADMIN_MENU_COUNT] =
+        {"Calibration", "User Weights", "Password"};
 
-    const char* items[] = {"Calibration", "User Weights"};
+    beginBtns();
     for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
-        int y = 44 + i * 22;
-        tft.setTextSize(1);
-        if (i == adminMenuItem) {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT, COL_HEADER_BG);
-            tft.setCursor(6, y); tft.print("> ");
-        } else {
-            tft.setTextColor(COL_LABEL, COL_BG);
-            tft.setCursor(6, y); tft.print("  ");
-        }
+        int16_t y = listRowY(i) + 8;
+        bool sel = (i == adminMenuItem);
+        uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
+        tft.fillRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, rowBg);
+        if (sel) tft.drawRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, COL_ACCENT);
+        tft.setTextSize(2);
+        tft.setTextColor(sel ? COL_ACCENT : COL_LABEL, rowBg);
+        tft.setCursor(UI_MARGIN + 12, y + (LIST_ROW_H - 4 - 16) / 2);
         tft.print(items[i]);
+        addBtn(B_ROW0 + i, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
+               nullptr, COL_ACCENT, true, sel);
     }
-    drawKeyHints("UP", "DN", "EXIT", "OK");
+    addBarBtn(B_EXIT, 0, 1, "EXIT", COL_LABEL);
+    drawAllBtns();
 }
 
 void drawAdminWeightsScreen() {
-
     drawHeader("USER WEIGHTS");
 
     int total = USER_COUNT + 1;
-    int visEnd = min(adminEditUser / USER_VISIBLE * USER_VISIBLE + USER_VISIBLE, total);
-    int visStart = visEnd - USER_VISIBLE;
-    if (visStart < 0) visStart = 0;
+    int vis   = min(listVisibleRows(), total);
+    if (adminEditUser < adminWeightScroll) adminWeightScroll = adminEditUser;
+    if (adminEditUser >= adminWeightScroll + vis) adminWeightScroll = adminEditUser - vis + 1;
 
-    for (int i = visStart; i < min(visStart + USER_VISIBLE, total); i++) {
-        int row = i - visStart;
-        int y = 26 + row * 26;
+    beginBtns();
+    for (int row = 0; row < vis; row++) {
+        int i = adminWeightScroll + row;
+        if (i >= total) break;
         bool isGuest = (i == USER_COUNT);
         const char* name = isGuest ? "Guest" : userNames[i];
+        int16_t y = listRowY(row);
+        bool sel = (i == adminEditUser);
 
-        // text background must match the row background (highlight bar vs plain)
-        uint16_t rowBg = (i == adminEditUser) ? COL_HEADER_BG : COL_BG;
-        if (i == adminEditUser) {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 24, COL_HEADER_BG);
-            tft.setTextColor(COL_ACCENT, rowBg);
-        } else {
-            tft.setTextColor(COL_LABEL, rowBg);
-        }
-        tft.setTextSize(1);
-        tft.setCursor(6, y);
-        tft.print(name);
+        uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
+        tft.fillRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, rowBg);
+        if (sel) tft.drawRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, COL_ACCENT);
+
         tft.setTextSize(2);
-        tft.setTextColor(i == adminEditUser ? COL_VALUE : COL_DIVIDER, rowBg);
-        tft.setCursor(TFT_WIDTH - 48, y);
-        tft.printf("%.0f", userWeights[i]);
+        tft.setTextColor(sel ? COL_ACCENT : COL_LABEL, rowBg);
+        tft.setCursor(UI_MARGIN + 12, y + (LIST_ROW_H - 4 - 16) / 2);
+        tft.print(name);
+
+        tft.setTextColor(sel ? COL_VALUE : COL_DIVIDER, rowBg);
+        tft.setCursor(TFT_WIDTH - UI_MARGIN - 68, y + (LIST_ROW_H - 4 - 16) / 2);
+        tft.printf("%3.0f", userWeights[i]);
         tft.setTextSize(1);
-        tft.setTextColor(COL_LABEL, rowBg);
         tft.print("kg");
+
+        addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
+               nullptr, COL_ACCENT, true, sel);
     }
-    drawKeyHints("UP", "DN", "BACK", "EDIT");
+    addBarBtn(B_BACK, 0, 2, "BACK", COL_LABEL);
+    addBarBtn(B_EDIT, 1, 2, "EDIT", COL_ACCENT);
+    drawAllBtns();
 }
 
 void drawAdminWeightEditScreen() {
-
     bool isGuest = (adminEditUser == USER_COUNT);
     const char* name = isGuest ? "Guest" : userNames[adminEditUser];
 
     drawHeader("EDIT WEIGHT");
 
-    tft.setTextSize(1);
+    tft.setTextSize(2);
     tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.setCursor(4, 24);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 8);
     tft.print(name);
 
-    tft.setTextSize(3);
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%3.0f", userWeights[adminEditUser]);
+    tft.setTextSize(6);
     tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(20, 50);
-    tft.printf("%.0f", userWeights[adminEditUser]);
-    tft.setTextSize(2);
-    tft.print(" kg");
+    tft.setCursor(30, CONTENT_Y + 44);
+    tft.print(buf);
+    tft.setTextSize(3);
+    tft.print("kg");
 
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 100);
-    tft.print("\x18 +1 kg    \x19 -1 kg");
+    beginBtns();
+    int16_t sy = CONTENT_Y + 120, sw = (TFT_WIDTH - UI_MARGIN * 5) / 4;
+    addBtn(B_DEC_BIG, UI_MARGIN,                     sy, sw, 52, "-5", COL_ERROR);
+    addBtn(B_DEC,     UI_MARGIN * 2 + sw,            sy, sw, 52, "-1", COL_LABEL);
+    addBtn(B_INC,     UI_MARGIN * 3 + sw * 2,        sy, sw, 52, "+1", COL_LABEL);
+    addBtn(B_INC_BIG, UI_MARGIN * 4 + sw * 3,        sy, sw, 52, "+5", COL_VALUE);
+    addBarBtn(B_CANCEL, 0, 2, "CANCEL", COL_LABEL);
+    addBarBtn(B_SAVE,   1, 2, "SAVE",   COL_VALUE);
+    drawAllBtns();
+}
 
-    drawKeyHints("+1", "-1", "BACK", "SAVE");
+// ───────── Numeric keypad (admin password entry) ─────────
+// 4 rows must fit between the dots row and the bottom edge:
+// KEY_Y0 + 4*KEY_H + 3*KEY_GAP = 92 + 208 + 15 = 315 < TFT_HEIGHT.
+#define KEY_W   74
+#define KEY_H   52
+#define KEY_GAP 5
+#define KEY_X0  ((TFT_WIDTH - KEY_W * 3 - KEY_GAP * 2) / 2)
+#define KEY_Y0  (CONTENT_Y + 56)
+
+void addKeypad(bool withEscape) {
+    static const char* const digits[9] = {"1","2","3","4","5","6","7","8","9"};
+    for (int i = 0; i < 9; i++) {
+        int16_t x = KEY_X0 + (i % 3) * (KEY_W + KEY_GAP);
+        int16_t y = KEY_Y0 + (i / 3) * (KEY_H + KEY_GAP);
+        addBtn(B_KEY1 + i, x, y, KEY_W, KEY_H, digits[i], COL_TEXT);
+    }
+    int16_t y = KEY_Y0 + 3 * (KEY_H + KEY_GAP);
+    addBtn(B_KEYDEL, KEY_X0,                        y, KEY_W, KEY_H, "DEL", COL_WARN);
+    addBtn(B_KEY0,   KEY_X0 + KEY_W + KEY_GAP,      y, KEY_W, KEY_H, "0",   COL_TEXT);
+    if (withEscape)
+        addBtn(B_KEYESC, KEY_X0 + (KEY_W + KEY_GAP) * 2, y, KEY_W, KEY_H, "ESC", COL_ERROR);
+}
+
+// Row of dots showing how many digits are entered.
+void drawPwdDots(int16_t y) {
+    int16_t step = 34, x0 = (TFT_WIDTH - step * CALIB_PASSWORD_LEN) / 2;
+    for (int i = 0; i < CALIB_PASSWORD_LEN; i++) {
+        tft.setTextSize(3);
+        tft.setTextColor(i < (int)pwdPos ? COL_ACCENT : COL_DIVIDER, COL_BG);
+        tft.setCursor(x0 + i * step + 8, y);
+        tft.print(i < (int)pwdPos ? "*" : "-");
+    }
 }
 
 void drawCalibAuthScreen() {
-
     drawHeader("ADMIN ACCESS");
 
-    tft.drawBitmap(56, 22, bmp_skull, 16, 16, COL_WARN);
+    tft.setTextSize(1);
+    tft.setTextColor(pwdWrong ? COL_ERROR : COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 6);
+    tft.print(pwdWrong ? "WRONG PASSWORD - try again" : "Enter password:      ");
+
+    drawPwdDots(CONTENT_Y + 24);
+
+    beginBtns();
+    addKeypad(true);
+    drawAllBtns();
+}
+
+void drawAdminPwdEditScreen() {
+    drawHeader("SET PASSWORD");
 
     tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 44);
-    tft.print("Enter password:");
+    tft.setTextColor(pwdConfirmPhase ? COL_WARN : COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 6);
+    tft.print(pwdConfirmPhase ? "Re-enter to confirm: " : "Enter NEW password:  ");
 
-    // Show entered dots
-    for (int i = 0; i < CALIB_PASSWORD_LEN; i++) {
-        tft.setTextSize(2);
-        tft.setTextColor(i < (int)pwdPos ? COL_ACCENT : COL_DIVIDER);
-        tft.setCursor(16 + i * 26, 58);
-        tft.print(i < (int)pwdPos ? "*" : "-");
-    }
+    drawPwdDots(CONTENT_Y + 24);
 
-    if (pwdWrong) {
-        tft.setTextSize(1);
-        tft.setTextColor(COL_ERROR, COL_BG);
-        tft.setCursor(4, 90);
-        tft.print("WRONG PASSWORD!");
-    }
-
-    tft.setTextSize(1);
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 108);
-    tft.print("\x18=0  \x19=1  #=2  *=3");
-
-    drawKeyHints("0", "1", "2", "3");
+    beginBtns();
+    addKeypad(true);
+    drawAllBtns();
 }
 
 void drawCalibScreen() {
-
     drawHeader("CALIBRATION");
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 22);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 6);
     tft.print("METERS / PULSE");
 
-    tft.setTextSize(1);
+    tft.setTextSize(3);
     tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(4, 36);
-    tft.printf("%.8f", calMetersPerPulse);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 22);
+    tft.printf("%.6f", calMetersPerPulse);
+
+    tft.setTextSize(2);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 56);
+    tft.printf("= %.4f m/rev ", calMetersPerPulse * PULSES_PER_REV);
+
+    drawDivider(CONTENT_Y + 84);
+
+    beginBtns();
+    int16_t sy = CONTENT_Y + 94, sw = (TFT_WIDTH - UI_MARGIN * 5) / 4;
+    addBtn(B_DEC_BIG, UI_MARGIN,              sy, sw, 52, "-10", COL_ERROR);
+    addBtn(B_DEC,     UI_MARGIN * 2 + sw,     sy, sw, 52, "-1",  COL_LABEL);
+    addBtn(B_INC,     UI_MARGIN * 3 + sw * 2, sy, sw, 52, "+1",  COL_LABEL);
+    addBtn(B_INC_BIG, UI_MARGIN * 4 + sw * 3, sy, sw, 52, "+10", COL_VALUE);
 
     tft.setTextSize(1);
     tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 54);
-    tft.printf("= %.4f m/rev", calMetersPerPulse * PULSES_PER_REV);
-
-    drawDivider(68);
-
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(4, 74);
-    tft.print("\x18 +0.000001");
-    tft.setCursor(4, 88);
-    tft.print("\x19 -0.000001");
-    tft.setCursor(4, 102);
-    tft.print("* SAVE & EXIT");
-    tft.setCursor(4, 116);
-    tft.print("# CANCEL");
-
-    tft.setTextSize(1);
+    tft.setCursor(UI_MARGIN, sy + 62);
+    tft.print("step = 0.000001 m/pulse");
     tft.setTextColor(COL_WARN, COL_BG);
-    tft.setCursor(4, 132);
-    tft.printf("Default: %.7f", (float)METERS_PER_PULSE);
+    tft.setCursor(UI_MARGIN, sy + 76);
+    tft.printf("Factory default: %.6f", (float)METERS_PER_PULSE);
 
-    drawKeyHints("+", "-", "BACK", "SAVE");
-}
-
-void drawUserSelectScreen() {
-
-    drawHeader("WHO ARE YOU?");
-
-    // scroll up indicator
-    if (userScrollOffset > 0) {
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
-        tft.setCursor(60, 20);
-        tft.print("\x1e");  // ▲
-    }
-
-    int totalUsers = USER_COUNT + 1;  // +1 for Guest
-    int visibleEnd = min(userScrollOffset + USER_VISIBLE, totalUsers);
-    for (int i = userScrollOffset; i < visibleEnd; i++) {
-        int row = i - userScrollOffset;
-        int y = 28 + row * 18;
-        bool isGuest = (i == USER_COUNT);
-        const char* name = isGuest ? "Guest" : userNames[i];
-
-        // text background must match the row background (highlight bar vs plain)
-        uint16_t rowBg = (i == currentUser) ? COL_HEADER_BG : COL_BG;
-        tft.setTextSize(1);
-        if (i == currentUser) {
-            tft.fillRect(2, y - 2, TFT_WIDTH - 4, 16, COL_HEADER_BG);
-            tft.setTextColor(isGuest ? COL_WARN : COL_ACCENT, rowBg);
-            tft.setCursor(6, y);
-            tft.print("> ");
-        } else {
-            tft.setTextColor(isGuest ? COL_WARN : COL_LABEL, rowBg);
-            tft.setCursor(6, y);
-            tft.print("  ");
-        }
-        tft.print(name);
-
-        // counter on right (Guest shows no number)
-        if (!isGuest) {
-            tft.setTextColor(COL_DIVIDER, rowBg);
-            tft.setCursor(TFT_WIDTH - 20, y);
-            tft.printf("%d/%d", i + 1, USER_COUNT);
-        }
-    }
-
-    // scroll down indicator
-    if (userScrollOffset + USER_VISIBLE < USER_COUNT + 1) {
-        tft.setTextColor(COL_LABEL, COL_BG);
-        tft.setTextSize(1);
-        tft.setCursor(60, 140);
-        tft.print("\x1f");  // ▼
-    }
-
-    drawKeyHints("UP", "DN", "BACK", "GO");
+    addBarBtn(B_CANCEL, 0, 2, "CANCEL", COL_LABEL);
+    addBarBtn(B_SAVE,   1, 2, "SAVE",   COL_VALUE);
+    drawAllBtns();
 }
 
 // ───────── Save to history ─────────
@@ -1485,8 +1838,6 @@ void processSensor() {
 
 // ───────── Admin entry ─────────
 void enterAdmin() {
-    memset(comboBuffer, 0, sizeof(comboBuffer));
-    comboPos = 0;
     pwdPos = 0; pwdWrong = false;
     beep(); delay(80); beep();
 #if CALIB_REQUIRE_PASSWORD
@@ -1497,133 +1848,58 @@ void enterAdmin() {
 #endif
 }
 
+// Feeds one keypad digit into pwdBuffer; returns true when the buffer filled.
+bool pwdPushDigit(uint8_t digit) {
+    beep();
+    pwdWrong = false;
+    if (pwdPos < CALIB_PASSWORD_LEN) pwdBuffer[pwdPos++] = digit;
+    return pwdPos >= CALIB_PASSWORD_LEN;
+}
+
+// Maps a keypad button id to its digit, or -1 if it is not a digit key.
+int keyDigit(uint8_t id) {
+    if (id >= B_KEY0 && id <= B_KEY9) return id - B_KEY0;
+    return -1;
+}
+
 // ───────── Handle input ─────────
 void handleInput() {
+    uint8_t hit = tappedBtn();
+
     switch (currentScreen) {
     case SCR_IDLE:
-        if (consume(btnUp))   { pushCombo(0); brightness = min(255, brightness + 25); setBacklight(brightness); }
-        if (consume(btnDown)) { pushCombo(1); brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); }
-        if (consume(btnHash)) { pushCombo(2); beep(); displayPage = 0; currentScreen = SCR_HISTORY; }
-        // * on idle: act on RELEASE so a held key can mean something different.
-        //   hold >= ADMIN_HOLD_MS          -> admin
-        //   short press after CALIB_COMBO  -> admin (legacy combo path)
-        //   short press otherwise          -> user select (start workout)
-        if (consume(btnStar)) starPressMs = millis();   // arm on press edge
-        if (starPressMs != 0) {
-            if (digitalRead(BTN_STAR_PIN) == LOW) {
-                if (millis() - starPressMs >= ADMIN_HOLD_MS) {
-                    starPressMs = 0;
-                    enterAdmin();                       // long press: admin
-                }
-            } else {                                    // released early: short press
-                starPressMs = 0;
-                if (checkCombo()) {
-                    enterAdmin();
-                } else {
-                    pushCombo(3);   // pollute the buffer: a normal * resets combo entry
-                    beep();
-                    currentUser = 0;
-                    userScrollOffset = 0;
-                    currentScreen = SCR_USER_SELECT;
-                }
-            }
+        // Hold anywhere on the title bar for ADMIN_HOLD_MS to open admin.
+        if (touch.hold) {
+            touch.hold = false;
+            if (touch.downY < HEADER_H) { uiDirty = true; enterAdmin(); return; }
+        }
+        switch (hit) {
+        case B_BRIGHT_UP: brightness = min(255, brightness + 25); setBacklight(brightness); break;
+        case B_BRIGHT_DN: brightness = max((uint8_t)10, (uint8_t)(brightness - 25)); setBacklight(brightness); break;
+        case B_HISTORY:   beep(); displayPage = 0; currentScreen = SCR_HISTORY; break;
+        case B_START:     beep(); currentUser = 0; userScrollOffset = 0;
+                          currentScreen = SCR_USER_SELECT; break;
         }
         break;
 
-    case SCR_CALIB_AUTH:
-        { // password entry — each button appends a digit
-            uint8_t pressed = 0xFF;
-            if (consume(btnUp))   pressed = 0;
-            if (consume(btnDown)) pressed = 1;
-            if (consume(btnHash)) pressed = 2;
-            if (consume(btnStar)) pressed = 3;
-            if (pressed != 0xFF) {
-                beep();
-                pwdWrong = false;
-                pwdBuffer[pwdPos++] = pressed;
-                if (pwdPos >= CALIB_PASSWORD_LEN) {
-                    bool ok = true;
-                    for (int i = 0; i < CALIB_PASSWORD_LEN; i++)
-                        if (pwdBuffer[i] != calibPassword[i]) { ok = false; break; }
-                    if (ok) {
-                        playTone(1600, 100);
-                        adminMenuItem = 0;
-                        currentScreen = SCR_ADMIN_MENU;
-                    } else {
-                        pwdWrong = true;
-                        pwdPos = 0;
-                        playTone(200, 300);
-                    }
-                }
-            }
+    case SCR_USER_SELECT: {
+        int total = USER_COUNT + 1;
+        int vis   = min(listVisibleRows(), total);
+        if (touch.swipe) {                       // swipe scrolls the list
+            userScrollOffset = constrain(userScrollOffset + touch.swipe * vis,
+                                         0, max(0, total - vis));
+            currentUser = constrain(currentUser, userScrollOffset,
+                                    min(total - 1, userScrollOffset + vis - 1));
+            touch.swipe = 0;
+            uiDirty = true;
+            break;
         }
-        break;
-
-    case SCR_ADMIN_MENU:
-        if (consume(btnUp))   { if (adminMenuItem > 0) adminMenuItem--; }
-        if (consume(btnDown)) { if (adminMenuItem < ADMIN_MENU_COUNT - 1) adminMenuItem++; }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
-        if (consume(btnStar)) {
-            beep();
-            if (adminMenuItem == 0) currentScreen = SCR_CALIB;
-            else if (adminMenuItem == 1) { adminEditUser = 0; currentScreen = SCR_ADMIN_WEIGHTS; }
-        }
-        break;
-
-    case SCR_CALIB:
-        if (consume(btnUp))   { calMetersPerPulse += 0.000001f; }
-        if (consume(btnDown)) { if (calMetersPerPulse > 0.000001f) calMetersPerPulse -= 0.000001f; }
-        if (consume(btnStar)) {
-            saveCalibration();
-            playTone(TONE_UPLOAD, 200);
-            currentScreen = SCR_ADMIN_MENU;
-        }
-        if (consume(btnHash)) {
-            loadCalibration();
-            beep();
-            currentScreen = SCR_ADMIN_MENU;
-        }
-        break;
-
-    case SCR_ADMIN_WEIGHTS:
-        if (consume(btnUp))   { if (adminEditUser > 0) adminEditUser--; }
-        if (consume(btnDown)) { if (adminEditUser < USER_COUNT) adminEditUser++; }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_ADMIN_MENU; }
-        if (consume(btnStar)) { beep(); currentScreen = SCR_ADMIN_WEIGHT_EDIT; }
-        break;
-
-    case SCR_ADMIN_WEIGHT_EDIT:
-        if (consume(btnUp))   { userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 1.0f); }
-        if (consume(btnDown)) { userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 1.0f); }
-        if (consume(btnStar)) {
-            saveWeights();
-            playTone(TONE_UPLOAD, 200);
-            currentScreen = SCR_ADMIN_WEIGHTS;
-        }
-        if (consume(btnHash)) {
-            loadCalibration();  // revert
-            beep();
-            currentScreen = SCR_ADMIN_WEIGHTS;
-        }
-        break;
-
-    case SCR_USER_SELECT:
-        if (consume(btnUp)) {
-            if (currentUser > 0) {
-                currentUser--;
-                if (currentUser < userScrollOffset)
-                    userScrollOffset = currentUser;
-            }
-        }
-        if (consume(btnDown)) {
-            if (currentUser < USER_COUNT) {  // USER_COUNT = Guest index
-                currentUser++;
-                if (currentUser >= userScrollOffset + USER_VISIBLE)
-                    userScrollOffset = currentUser - USER_VISIBLE + 1;
-            }
-        }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
-        if (consume(btnStar)) {
+        if (hit >= B_ROW0 && hit <= B_ROW8) {
+            int i = userScrollOffset + (hit - B_ROW0);
+            if (i < total) { beep(); currentUser = i; }
+        } else if (hit == B_BACK) {
+            beep(); currentScreen = SCR_IDLE;
+        } else if (hit == B_START) {
             beep();
             resetWorkout();
             workoutActive = true;
@@ -1632,9 +1908,10 @@ void handleInput() {
             playTone(TONE_START, TONE_DURATION);
         }
         break;
+    }
 
     case SCR_WORKOUT:
-        if (consume(btnHash)) {
+        if (hit == B_PAUSE) {
             workoutElapsedMs += millis() - workoutStartMs;
             workoutActive = false;
             currentScreen = SCR_PAUSED;
@@ -1643,34 +1920,177 @@ void handleInput() {
         break;
 
     case SCR_PAUSED:
-        if (consume(btnStar)) {
+        if (hit == B_RESUME) {
             beep();
             workoutActive = true;
             workoutStartMs = millis();
             currentScreen = SCR_WORKOUT;
             playTone(TONE_START, TONE_DURATION);
-        }
-        if (consume(btnHash)) {
+        } else if (hit == B_FINISH) {
             beep();
             currentScreen = SCR_UPLOADING;
         }
         break;
 
     case SCR_SUMMARY:
-        if (consume(btnHash)) {
-            beep();
-            currentScreen = SCR_IDLE;
-        }
+        if (hit == B_OK) { beep(); currentScreen = SCR_IDLE; }
         break;
 
     case SCR_HISTORY:
-        if (consume(btnUp))   { if (displayPage > 0) displayPage--; }
-        if (consume(btnDown)) { if (displayPage < historyCount - 1) displayPage++; }
-        if (consume(btnHash)) { beep(); currentScreen = SCR_IDLE; }
+        if (touch.swipe) {
+            displayPage = constrain(displayPage + touch.swipe, 0, max(0, historyCount - 1));
+            touch.swipe = 0;
+            uiDirty = true;
+            break;
+        }
+        if (hit == B_PREV)      { if (displayPage > 0) displayPage--; }
+        else if (hit == B_NEXT) { if (displayPage < historyCount - 1) displayPage++; }
+        else if (hit == B_BACK) { beep(); currentScreen = SCR_IDLE; }
         break;
+
+    case SCR_CALIB_AUTH: {
+        int d = keyDigit(hit);
+        if (d >= 0) {
+            if (pwdPushDigit((uint8_t)d)) {
+                bool ok = true;
+                for (int i = 0; i < CALIB_PASSWORD_LEN; i++)
+                    if (pwdBuffer[i] != adminPwd[i]) { ok = false; break; }
+                pwdPos = 0;
+                if (ok) {
+                    playTone(1600, 100);
+                    adminMenuItem = 0;
+                    currentScreen = SCR_ADMIN_MENU;
+                } else {
+                    pwdWrong = true;
+                    playTone(200, 300);
+                }
+            }
+        } else if (hit == B_KEYDEL) {
+            beep(); if (pwdPos > 0) pwdPos--;
+        } else if (hit == B_KEYESC) {
+            beep(); pwdPos = 0; pwdWrong = false; currentScreen = SCR_IDLE;
+        }
+        break;
+    }
+
+    case SCR_ADMIN_MENU:
+        if (hit >= B_ROW0 && hit < B_ROW0 + ADMIN_MENU_COUNT) {
+            beep();
+            adminMenuItem = hit - B_ROW0;
+            if (adminMenuItem == 0) currentScreen = SCR_CALIB;
+            else if (adminMenuItem == 1) { adminEditUser = 0; currentScreen = SCR_ADMIN_WEIGHTS; }
+            else {
+                pwdPos = 0; pwdConfirmPhase = 0;
+                pwdEditLastKeyMs = millis();
+                currentScreen = SCR_ADMIN_PWD_EDIT;
+            }
+        } else if (hit == B_EXIT) {
+            beep(); currentScreen = SCR_IDLE;
+        }
+        break;
+
+    case SCR_CALIB:
+        switch (hit) {
+        case B_INC:     calMetersPerPulse += 0.000001f; break;
+        case B_INC_BIG: calMetersPerPulse += 0.000010f; break;
+        case B_DEC:     if (calMetersPerPulse > 0.000001f) calMetersPerPulse -= 0.000001f; break;
+        case B_DEC_BIG: calMetersPerPulse = max(0.000001f, calMetersPerPulse - 0.000010f); break;
+        case B_SAVE:
+            saveCalibration();
+            playTone(TONE_UPLOAD, 200);
+            currentScreen = SCR_ADMIN_MENU;
+            break;
+        case B_CANCEL:
+            loadCalibration();
+            beep();
+            currentScreen = SCR_ADMIN_MENU;
+            break;
+        }
+        break;
+
+    case SCR_ADMIN_WEIGHTS: {
+        int total = USER_COUNT + 1;
+        if (touch.swipe) {
+            int vis = min(listVisibleRows(), total);
+            adminEditUser = constrain(adminEditUser + touch.swipe * vis, 0, total - 1);
+            touch.swipe = 0;
+            uiDirty = true;
+            break;
+        }
+        if (hit >= B_ROW0 && hit <= B_ROW8) {
+            int i = adminWeightScroll + (hit - B_ROW0);
+            if (i < total) {
+                beep();
+                // second tap on the already-selected row opens the editor
+                if (i == adminEditUser) currentScreen = SCR_ADMIN_WEIGHT_EDIT;
+                else adminEditUser = i;
+            }
+        } else if (hit == B_BACK) {
+            beep(); currentScreen = SCR_ADMIN_MENU;
+        } else if (hit == B_EDIT) {
+            beep(); currentScreen = SCR_ADMIN_WEIGHT_EDIT;
+        }
+        break;
+    }
+
+    case SCR_ADMIN_WEIGHT_EDIT:
+        switch (hit) {
+        case B_INC:     userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 1.0f); break;
+        case B_INC_BIG: userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 5.0f); break;
+        case B_DEC:     userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 1.0f); break;
+        case B_DEC_BIG: userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 5.0f); break;
+        case B_SAVE:
+            saveWeights();
+            playTone(TONE_UPLOAD, 200);
+            currentScreen = SCR_ADMIN_WEIGHTS;
+            break;
+        case B_CANCEL:
+            loadCalibration();   // revert weights from NVS
+            beep();
+            currentScreen = SCR_ADMIN_WEIGHTS;
+            break;
+        }
+        break;
+
+    case SCR_ADMIN_PWD_EDIT: {
+        int d = keyDigit(hit);
+        if (d >= 0) {
+            pwdEditLastKeyMs = millis();
+            if (pwdPushDigit((uint8_t)d)) {
+                pwdPos = 0;
+                if (pwdConfirmPhase == 0) {
+                    memcpy(pwdNew, pwdBuffer, CALIB_PASSWORD_LEN);
+                    pwdConfirmPhase = 1;
+                } else if (memcmp(pwdNew, pwdBuffer, CALIB_PASSWORD_LEN) == 0) {
+                    memcpy(adminPwd, pwdNew, CALIB_PASSWORD_LEN);
+                    saveAdminPwd();
+                    playTone(TONE_UPLOAD, 200);   // saved
+                    currentScreen = SCR_ADMIN_MENU;
+                } else {
+                    playTone(200, 300);           // mismatch: start over
+                    pwdConfirmPhase = 0;
+                }
+            }
+        } else if (hit == B_KEYDEL) {
+            beep(); pwdEditLastKeyMs = millis(); if (pwdPos > 0) pwdPos--;
+        } else if (hit == B_KEYESC) {
+            beep(); currentScreen = SCR_ADMIN_MENU;   // cancel, keep old password
+        }
+        if (millis() - pwdEditLastKeyMs > PWD_EDIT_TIMEOUT_MS) {
+            beep();                                   // idle timeout = cancel
+            uiDirty = true;
+            currentScreen = SCR_ADMIN_MENU;
+        }
+        break;
+    }
 
     default: break;
     }
+
+    // Any unconsumed gesture must not leak into the next screen.
+    touch.tap = false;
+    touch.hold = false;
+    touch.swipe = 0;
 }
 
 // ───────── Display refresh ─────────
@@ -1678,25 +2098,7 @@ unsigned long lastRedraw = 0;
 #define REDRAW_MS 1000
 Screen lastDrawnScreen = (Screen)-1;
 
-void refreshDisplay() {
-    bool screenChanged = (currentScreen != lastDrawnScreen);
-    // Full clear when entering a screen or after a key press changed UI state.
-    // Periodic redraws (workout timer, idle sensor value) repaint in place
-    // with background-colored text + targeted fillRects — no clear, no flicker.
-    bool needsClear = screenChanged || uiDirty;
-
-    // Screens with live data; everything else redraws only on input/transition
-    bool needsPeriodicRefresh = (currentScreen == SCR_WORKOUT || currentScreen == SCR_PAUSED ||
-                                 currentScreen == SCR_IDLE);
-
-    if (!needsClear && (!needsPeriodicRefresh || millis() - lastRedraw < REDRAW_MS)) return;
-    lastRedraw = millis();
-    uiDirty = false;
-    if (needsClear) {
-        tft.fillScreen(COL_BG);
-        lastDrawnScreen = currentScreen;
-    }
-
+void drawCurrentScreen() {
     switch (currentScreen) {
         case SCR_IDLE:        drawIdleScreen(); break;
         case SCR_USER_SELECT: drawUserSelectScreen(); break;
@@ -1708,8 +2110,36 @@ void refreshDisplay() {
         case SCR_CALIB:             drawCalibScreen(); break;
         case SCR_ADMIN_WEIGHTS:     drawAdminWeightsScreen(); break;
         case SCR_ADMIN_WEIGHT_EDIT: drawAdminWeightEditScreen(); break;
+        case SCR_ADMIN_PWD_EDIT:    drawAdminPwdEditScreen(); break;
         default: break;
     }
+}
+
+void refreshDisplay() {
+    bool screenChanged = (currentScreen != lastDrawnScreen);
+    // Full clear when entering a screen or after a touch changed UI state.
+    // Periodic redraws (workout timer, idle sensor value) repaint in place
+    // with background-colored text + targeted fillRects — no clear, no flicker.
+    bool needsClear = screenChanged || uiDirty;
+
+    // Screens with live data; everything else redraws only on input/transition
+    bool needsPeriodicRefresh = (currentScreen == SCR_WORKOUT || currentScreen == SCR_PAUSED ||
+                                 currentScreen == SCR_IDLE);
+
+    if (!needsClear && (!needsPeriodicRefresh || millis() - lastRedraw < REDRAW_MS)) {
+        // Nothing to repaint except the press highlight on the current buttons.
+        if (btnDirty) { btnDirty = false; drawAllBtns(); }
+        return;
+    }
+    lastRedraw = millis();
+    uiDirty = false;
+    btnDirty = false;
+    if (needsClear) {
+        tft.fillScreen(COL_BG);
+        lastDrawnScreen = currentScreen;
+    }
+
+    drawCurrentScreen();
 }
 
 // ───────── Setup ─────────
@@ -1717,58 +2147,54 @@ void setup() {
     Serial.begin(115200);
 
     // Backlight (LEDC channel 0)
-    if (TFT_BL >= 0) {
-        ledcSetup(0, 5000, 8);
-        ledcAttachPin(TFT_BL, 0);
-        setBacklight(brightness);
-    }
+    ledcSetup(0, 5000, 8);
+    ledcAttachPin(TFT_BL, 0);
+    setBacklight(0);          // stay dark until the panel has something to show
 
-    // Speaker (LEDC channel 1)
-    ledcSetup(1, 2000, 8);
-    ledcAttachPin(SPEAKER_PIN, 1);
-
-    // TFT
-    tft.initR(INITR_BLACKTAB);
-    tft.setRotation(0);
+    // TFT on hardware SPI2
+    tftSPI.begin(TFT_SCLK, -1, TFT_MOSI, -1);
+    tft.init(TFT_WIDTH, TFT_HEIGHT);
+    tft.setSPISpeed(TFT_SPI_HZ);
+    tft.setRotation(TFT_ROTATION);
     tft.fillScreen(COL_BG);
     tft.setTextWrap(false);
+    setBacklight(brightness);
 
-    // Splash with animation
-    tft.fillScreen(COL_BG);
+    // Touch panel. It is the only input on this board, so a failure has to be
+    // visible on the panel itself — otherwise the device just looks frozen.
+    bool touchOk = cstInit();
+    if (!touchOk) {
+        Serial.println("[TOUCH] CST328 init failed — UI will not respond");
+        drawCentered(120, "TOUCH INIT FAILED", 2, COL_ERROR);
+        drawCentered(150, "check the CST328 ribbon", 1, COL_LABEL);
+        delay(2500);
+        tft.fillScreen(COL_BG);
+    }
 
-    // Animated waves filling up
-    for (int y = 150; y >= 90; y -= 4) {
-        for (int x = 0; x < 128; x += 16) {
-            tft.drawBitmap(x, y, bmp_wave, 16, 16, BLUE);
-        }
+    // Audio (I2S -> PCM5101)
+    initAudio();
+
+    // Splash: waves rise from the bottom, then the rower and the title land
+    // above them (220..260 waves, 170..218 rower, 40..148 text — no overlap).
+    for (int y = TFT_HEIGHT - 60; y >= TFT_HEIGHT / 2 + 60; y -= 8) {
+        for (int x = 0; x < TFT_WIDTH; x += 32)
+            drawIcon(x, y, bmp_wave, BLUE, 2);
         delay(40);
     }
 
-    // Rower appears
-    tft.drawBitmap(56, 60, bmp_rower, 16, 16, COL_ACCENT);
+    drawIcon((TFT_WIDTH - 48) / 2, 170, bmp_rower, COL_ACCENT, 3);
     delay(200);
 
-    // Title
-    tft.setTextSize(2);
-    tft.setTextColor(COL_ACCENT, COL_BG);
-    tft.setCursor(8, 20);
-    tft.print("WATER");
-    tft.setCursor(8, 38);
-    tft.print("ROWER");
+    drawCentered(40, "WATER", 4, COL_ACCENT);
+    drawCentered(78, "ROWER", 4, COL_ACCENT);
+    drawCentered(120, "v3.0  touch edition", 1, COL_VALUE);
 
-    tft.setTextSize(1);
-    tft.setTextColor(COL_VALUE, COL_BG);
-    tft.setCursor(80, 25);
-    tft.print("v2.0");
-
-    tft.setTextColor(COL_LABEL, COL_BG);
-    tft.setCursor(20, 80);
 #ifdef SENSOR_TYPE_LDR
-    tft.print("Sensor: LDR");
+    drawCentered(140, "Sensor: LDR", 1, COL_LABEL);
 #elif defined(SENSOR_TYPE_HALL)
-    tft.print("Sensor: Hall");
+    drawCentered(140, "Sensor: Hall", 1, COL_LABEL);
 #elif defined(SENSOR_TYPE_BLOCKER)
-    tft.print("Sensor: Blocker");
+    drawCentered(140, "Sensor: Blocker", 1, COL_LABEL);
 #endif
 
     // Sensor pins
@@ -1791,14 +2217,9 @@ void setup() {
                     BLOCKER_ACTIVE_LOW ? FALLING : RISING);
 #endif
 
-    // Button pins
-    pinMode(BTN_UP_PIN,   INPUT_PULLUP);
-    pinMode(BTN_DOWN_PIN, INPUT_PULLUP);
-    pinMode(BTN_HASH_PIN, INPUT_PULLUP);
-    pinMode(BTN_STAR_PIN, INPUT_PULLUP);
-
-    // Load saved calibration from NVS
+    // Load saved calibration + admin password from NVS
     loadCalibration();
+    loadAdminPwd();
 
     // BLE FTMS
     initBLE();
@@ -1809,21 +2230,19 @@ void setup() {
 
     // Startup sound
     playTone(800, 100);
-    delay(50);
     playTone(1200, 100);
-    delay(50);
     playTone(1600, 150);
 
-    delay(1000);
+    delay(600);
     currentScreen = SCR_IDLE;
 }
 
 // ───────── Loop ─────────
 void loop() {
-    readAllButtons();
+    pollTouch();
     handleInput();
 
-    // Read sensor (LDR: fast polling / Hall: ISR updates globals)
+    // Read sensor (LDR: timer ISR / Hall & blocker: edge ISR updates globals)
     readSensor();
 
     processSensor();
@@ -1852,6 +2271,7 @@ void loop() {
         currentScreen = SCR_SUMMARY;
         lastDrawnScreen = SCR_SUMMARY;
         uiDirty = false;   // summary drawn directly; a stale flag would blank it next frame
+        btnDirty = false;
         return;
     }
 

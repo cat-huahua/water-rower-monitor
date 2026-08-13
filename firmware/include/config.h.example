@@ -6,11 +6,11 @@
 #define WIFI_SSIDS     {"HomeWiFi", "MobileHotspot"}
 #define WIFI_PASSWORDS {"homepass", "hotspotpass"}
 
-// ===== GitHub =====
-#define GITHUB_TOKEN  "ghp_YOUR_PERSONAL_ACCESS_TOKEN"
-#define GITHUB_OWNER  "YOUR_GITHUB_USERNAME"
-#define GITHUB_REPO   "YOUR_PRIVATE_REPO_NAME"
-#define GITHUB_BRANCH "main"
+// ===== TrueNAS (local network upload, plain HTTP) =====
+// Workouts are POSTed to the TrueNAS filesystem/put API as one JSON per session
+#define NAS_HOST    "192.168.1.100"
+#define NAS_API_KEY "YOUR_TRUENAS_API_KEY"
+#define NAS_PATH    "/mnt/pool/water_rower_records"
 
 // ===== Machine Info =====
 #define MACHINE_SN    "000000"
@@ -23,97 +23,130 @@
 // ===== Default weight (kg) — used when no NVS value saved yet =====
 #define DEFAULT_WEIGHT_KG 70.0f
 
-// ===== Per-user passwords (button IDs: 0=UP 1=DN 2=# 3=*) =====
+// ===== Per-user passwords (digits 0-9, reserved — not used by the firmware) =====
 #define USER_PASSWORD_LEN 4
 #define USER_PASSWORDS { {1,2,3,0}, {0,3,2,1} }
 
-// ===== ST7735S TFT Pins (SPI — ESP32-S3) =====
-#define TFT_CS        GPIO_NUM_10
-#define TFT_RST       GPIO_NUM_9
-#define TFT_DC        GPIO_NUM_8
-#define TFT_MOSI      GPIO_NUM_11   // SDA
-#define TFT_SCLK      GPIO_NUM_12   // SCL
-#define TFT_BL        GPIO_NUM_13   // Backlight
+// ═══════════════════════════════════════════════════════════════════════
+//  Board: Waveshare ESP32-S3-Touch-LCD-2.8
+//  https://www.waveshare.com/wiki/ESP32-S3-Touch-LCD-2.8
+//  ESP32-S3R8 · 16 MB flash · 8 MB PSRAM
+//  Everything in this block is wired on the PCB — changing a value here
+//  does not rewire anything, it only breaks the driver.
+// ═══════════════════════════════════════════════════════════════════════
 
-#define TFT_WIDTH     128
-#define TFT_HEIGHT    160
+// ===== Display: ST7789 240x320 IPS, SPI2/FSPI =====
+#define TFT_SCLK      GPIO_NUM_40
+#define TFT_MOSI      GPIO_NUM_45
+#define TFT_CS        GPIO_NUM_42
+#define TFT_DC        GPIO_NUM_41
+#define TFT_RST       GPIO_NUM_39
+#define TFT_BL        GPIO_NUM_5    // backlight, PWM via LEDC channel 0
+#define TFT_WIDTH     240
+#define TFT_HEIGHT    320
+#define TFT_SPI_HZ    40000000
+#define TFT_ROTATION  0             // 0 = portrait
+
+// ===== Capacitive touch: CST328, I2C bus 1 (Wire1) =====
+#define TOUCH_SDA       GPIO_NUM_1
+#define TOUCH_SCL       GPIO_NUM_3
+#define TOUCH_RST       GPIO_NUM_2
+#define TOUCH_INT       GPIO_NUM_4
+#define TOUCH_I2C_ADDR  0x1A
+#define TOUCH_I2C_HZ    400000
+// Panel-to-screen orientation. These defaults match the Waveshare reference
+// configuration (no swap, no mirror) at TFT_ROTATION 0. If taps land mirrored
+// or on the wrong axis, flip the matching flag — nothing else needs changing.
+#define TOUCH_SWAP_XY   false
+#define TOUCH_MIRROR_X  false
+#define TOUCH_MIRROR_Y  false
+// Tap qualification
+#define TAP_MIN_MS      30    // shorter contact = noise
+#define TAP_MAX_DRIFT   35    // px of movement still counted as a tap, not a drag
+#define TOUCH_POLL_MS   15    // I2C poll period
+
+// ===== Audio: on-board PCM5101 I2S DAC -> amplifier -> speaker header =====
+// 8Ω 2W speaker; absolute loudness is also set by the on-board volume trimmer.
+#define I2S_BCLK        GPIO_NUM_48
+#define I2S_LRCK        GPIO_NUM_38
+#define I2S_DOUT        GPIO_NUM_47
+#define I2S_SAMPLE_RATE 22050
+#define TONE_VOLUME     0.35f       // 0.0-1.0 digital level
 
 // ============================================================
-// ===== SENSOR TYPE — Uncomment ONE of the three options =====
+// ===== SENSOR TYPE — Uncomment ONE of the two options =====
 // ============================================================
 
-// Option A: LDR (光敏电阻 / Photoresistor)
-//   - Original WaterRower optical sensor, 3-wire (VCC, Signal, GND)
-//   - Analog read, no extra hardware needed
-#define SENSOR_TYPE_LDR
+// Option A: Optical Blocker / Slot Sensor (光遮断器/槽型光耦)
+//   - The original WaterRower sensor (Optek OPB365T55), or HY301/ITR9608
+//   - Flywheel paddle breaks the IR beam → digital pulse
+//   - 3-wire (VCC, Signal, GND), digital interrupt
+#define SENSOR_TYPE_BLOCKER
 
 // Option B: Hall Effect Sensor (霍尔传感器)
 //   - Needs a Hall sensor (A3144/OH3144/SS49E) + magnet on flywheel
-//   - Digital interrupt, very reliable
+//   - Digital interrupt, runs off 3.3V
 // #define SENSOR_TYPE_HALL
 
-// Option C: Optical Blocker / Slot Sensor (光遮断器/槽型光耦)
-//   - e.g. HY301, ITR9608, GP1A57HRJ00F
-//   - Flywheel paddle breaks IR beam → digital pulse
-//   - 3-wire (VCC, Signal, GND), digital interrupt
-// #define SENSOR_TYPE_BLOCKER
+// Option C: LDR (光敏电阻) — NOT usable on this board, see the #error below
+// #define SENSOR_TYPE_LDR
 
-// ===== LDR Settings (only used if SENSOR_TYPE_LDR) =====
-#define LDR_SIGNAL_PIN    GPIO_NUM_1   // ADC1 — analog read
+// The 12PIN header exposes only GPIO18 and GPIO15 as free I/O (the rest are
+// USB D±, the I2C bus shared with the on-board IMU/RTC, and UART0). GPIO18 is
+// used for the flywheel sensor; GPIO15 is left spare.
+//
+// Both are ADC2 channels, and the radio claims ADC2 as soon as WiFi comes up,
+// so an analog sensor cannot be read on this board.
+#ifdef SENSOR_TYPE_LDR
+  #error "SENSOR_TYPE_LDR needs an ADC1 pin; the 12PIN header only exposes ADC2 (GPIO18/15), which stops working once WiFi starts. Use SENSOR_TYPE_BLOCKER or SENSOR_TYPE_HALL, or move the sensor to GPIO10 and give up the on-board IMU/RTC I2C bus."
+#endif
+
+// ===== LDR Settings (unsupported on this board, see above) =====
+#define LDR_SIGNAL_PIN    GPIO_NUM_18
 #define LDR_THRESHOLD     2000         // 0-4095, adjust after testing!
 #define LDR_HYSTERESIS    300          // prevent noise triggering
 
 // ===== Hall Settings (only used if SENSOR_TYPE_HALL) =====
-#define HALL_SENSOR_PIN   GPIO_NUM_4   // digital interrupt pin
+#define HALL_SENSOR_PIN   GPIO_NUM_18
 #define HALL_MIN_PULSE_US 5000         // minimum pulse interval (noise filter)
 
 // ===== Blocker Settings (only used if SENSOR_TYPE_BLOCKER) =====
-// HW-487 / LM393 style optical interrupter (WaterRower original sensor)
-// IMPORTANT: Needs 5V supply! Connect VCC to 5Vin, NOT 3.3V
-// Typical wiring: Red=5V(VIN), Green=GND, Blue=SIG
-#define BLOCKER_SENSOR_PIN   GPIO_NUM_5   // digital interrupt pin
-#define BLOCKER_MIN_PULSE_US 1500         // minimum pulse interval (noise filter)
+// IMPORTANT: the original WaterRower sensor needs 5V — its IR LED is too dim
+// at 3.3V. Take 5V from the 12PIN VBus pin, which is only live while USB-C is
+// plugged in; a battery-only session needs an external 5V boost converter.
+// Typical wiring: Red=5V(VBus), Green=GND, Blue=SIG(GPIO18)
+#define BLOCKER_SENSOR_PIN   GPIO_NUM_18  // digital interrupt pin
+#define BLOCKER_MIN_PULSE_US 300          // minimum pulse interval (noise filter)
 #define BLOCKER_ACTIVE_LOW   true         // true=signal LOW when blocked, false=HIGH
 
-// ===== 4 Built-in Buttons on TFT module =====
-#define BTN_UP_PIN    GPIO_NUM_5    // K1
-#define BTN_DOWN_PIN  GPIO_NUM_6    // K2
-#define BTN_HASH_PIN  GPIO_NUM_7    // K3 (#)
-#define BTN_STAR_PIN  GPIO_NUM_15   // K4 (*)
-
-// ===== Speaker (喇叭) =====
-#define SPEAKER_PIN   GPIO_NUM_16
-#define TONE_START    1000   // Hz
-#define TONE_STOP     500    // Hz
-#define TONE_BEEP     1500   // Hz
-#define TONE_UPLOAD   2000   // Hz
+// ===== Sound effects =====
+#define TONE_START    1000   // Hz — workout start
+#define TONE_STOP     500    // Hz — workout stop
+#define TONE_BEEP     1500   // Hz — touch feedback
+#define TONE_UPLOAD   2000   // Hz — upload success
 #define TONE_DURATION 150    // ms
 
-// ===== Admin / Calibration access =====
-// A secret button combo on the IDLE screen opens admin mode.
-// Buttons: 0=UP(K1)  1=DOWN(K2)  2=#(K3)  3=*(K4).
-// Enter the combo, then press * to confirm (* is NOT part of the combo).
-// Avoid 2 (#) in the combo — # on the idle screen opens History.
-#define CALIB_COMBO            {0,1,0,1}
-#define CALIB_COMBO_LEN        4
-// Password AFTER the combo. Default: NO password — the combo alone opens admin.
-// Set CALIB_REQUIRE_PASSWORD to 1 to require the password below.
+// ===== Admin access =====
+// There are no physical keys on this board: admin opens by HOLDING the title
+// bar on the idle screen for 3 s. The password (if enabled) is then typed on
+// an on-screen numeric keypad — digits 0-9.
+// Default: NO password — the hold alone opens admin.
 #define CALIB_REQUIRE_PASSWORD 0
-#define CALIB_PASSWORD         {3,2,1,0}
-#define CALIB_PASSWORD_LEN     4
+#define CALIB_PASSWORD     {3,2,1,0}           // factory default; changeable in admin
+#define CALIB_PASSWORD_LEN 4
 
 // ===== Calibration =====
 #define PULSES_PER_REV      60                  // 60 teeth -> 60 pulses per paddle revolution
 
-// Distance model (water-resistance rower): ~constant meters per revolution.
-// METERS_PER_REV is the calibration TARGET. Default ~1.4 m/rev is a physics estimate
-// for this machine (tank D~0.5m, ~17kg water, paddle ~2-4 rev/s). CALIBRATE on the real
-// machine:  new METERS_PER_REV = current METERS_PER_REV * (actual distance / shown distance)
-#define METERS_PER_REV      1.4f
-#define METERS_PER_PULSE    (METERS_PER_REV / PULSES_PER_REV)   // ~0.0233 m per pulse
+// Distance model (water-resistance rower): ~constant meters per pulse.
+// CALIBRATE on the real machine from the admin menu:
+//   new METERS_PER_PULSE = current * (actual distance / shown distance)
+#define METERS_PER_PULSE    (0.00278f)
 
-// Stroke detection (acceleration-based; see processSensor)
+// Stroke detection (see processSensor)
+#define STROKE_GAP_MS       500
 #define STROKE_MIN_MS       600                 // min ms between strokes (~100 SPM ceiling)
-#define STROKE_HYST         0.06f               // fractional interval reversal to flip drive/recovery
+#define STROKE_HYST         0.15f               // fractional interval reversal to flip drive/recovery
+#define CAL_PER_METER       0.04f
 
 #define IDLE_TIMEOUT_MS     3000
