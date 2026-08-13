@@ -119,9 +119,16 @@ Fully touch-driven — the board has no user keys.
 Finished size is 71.6 × 94.1 × 19.6 mm — there is no battery door because the
 power bank stays outside.
 
-Measure your board before printing — `pcb_w` / `pcb_l` in `enclosure.scad`
-default to the published 86 × 56 mm and should be confirmed against the real
-thing.
+Board geometry comes from Waveshare's own outline drawing, so the PCB size
+(49.90 × 69.00), glass size (50.54 × 73.06) and the 41 × 60 mm mounting hole
+pattern are exact rather than guessed. Two consequences shape the design: the
+glass **overhangs the PCB on every edge**, so nothing clamps the board's edges —
+it hangs on four M2.5 posts — and every connector is on the back, so the lid
+needs no cutouts at all.
+
+Three values still need confirming against the real board before printing the
+lid: `pcb_screw_d` (the drawing omits hole diameter), `glass_off_y` (derived
+from the drawing's 1.9 mm callout) and `usb_edge_off`.
 
 ## Workout Data
 
