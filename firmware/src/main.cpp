@@ -271,15 +271,55 @@ class FTMSCallbacks : public BLEServerCallbacks {
 };
 
 // ───────── Users ─────────
-static const char* const userNames[] = USER_NAMES;
-int currentUser = 0;
-int userScrollOffset = 0;
+// The roster is editable at runtime and lives in NVS; config.h's USER_NAMES is
+// only the seed used the first time the device boots with an empty namespace.
+// Guest is not a stored user — it is the virtual row at index userCount, which
+// is why weights and passwords are indexed by slot while Guest keeps its own.
+#define MAX_USERS      8
+#define USER_NAME_LEN  9    // 8 visible characters + NUL
+
+char  userNames[MAX_USERS][USER_NAME_LEN] = {};
+int   userCount = 0;
+int   currentUser = 0;
+int   userScrollOffset = 0;
 #define USER_VISIBLE 5   // rows that fit on screen
 
 // ───────── NVS / Calibration ─────────
 Preferences prefs;
 float calMetersPerPulse = METERS_PER_PULSE;
-float userWeights[USER_COUNT + 1];   // +1 for Guest (index USER_COUNT)
+float userWeights[MAX_USERS] = {};
+float guestWeight = DEFAULT_WEIGHT_KG;
+
+inline bool isGuestIdx(int u)  { return u < 0 || u >= userCount; }
+inline const char* nameOf(int u) { return isGuestIdx(u) ? "Guest" : userNames[u]; }
+inline float weightOf(int u)   { return isGuestIdx(u) ? guestWeight : userWeights[u]; }
+inline void setWeightOf(int u, float w) {
+    if (isGuestIdx(u)) guestWeight = w; else userWeights[u] = w;
+}
+
+void loadUsers() {
+    static const char* const seed[] = USER_NAMES;
+    prefs.begin("wrower", true);
+    int n = prefs.getInt("ucnt", -1);
+    if (n >= 0 && n <= MAX_USERS && prefs.getBytesLength("unames") == sizeof(userNames)) {
+        prefs.getBytes("unames", userNames, sizeof(userNames));
+        userCount = n;
+        prefs.end();
+    } else {
+        prefs.end();                       // first boot: seed from config.h
+        userCount = min((int)USER_COUNT, (int)MAX_USERS);
+        for (int i = 0; i < userCount; i++)
+            strncpy(userNames[i], seed[i], USER_NAME_LEN - 1);
+    }
+    for (int i = 0; i < MAX_USERS; i++) userNames[i][USER_NAME_LEN - 1] = '\0';
+}
+
+void saveUsers() {
+    prefs.begin("wrower", false);
+    prefs.putInt("ucnt", userCount);
+    prefs.putBytes("unames", userNames, sizeof(userNames));
+    prefs.end();
+}
 
 void loadCalibration() {
     prefs.begin("wrower", true);
@@ -287,10 +327,11 @@ void loadCalibration() {
     // Heal implausible stored values (e.g. old 60x-too-small calibration)
     if (calMetersPerPulse < 0.00005f || calMetersPerPulse > 0.01f)
         calMetersPerPulse = METERS_PER_PULSE;
-    for (int i = 0; i <= USER_COUNT; i++) {
+    for (int i = 0; i < MAX_USERS; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
         userWeights[i] = prefs.getFloat(key, DEFAULT_WEIGHT_KG);
     }
+    guestWeight = prefs.getFloat("wg", DEFAULT_WEIGHT_KG);
     prefs.end();
 }
 void saveCalibration() {
@@ -300,10 +341,11 @@ void saveCalibration() {
 }
 void saveWeights() {
     prefs.begin("wrower", false);
-    for (int i = 0; i <= USER_COUNT; i++) {
+    for (int i = 0; i < MAX_USERS; i++) {
         char key[6]; snprintf(key, sizeof(key), "w%d", i);
         prefs.putFloat(key, userWeights[i]);
     }
+    prefs.putFloat("wg", guestWeight);
     prefs.end();
 }
 
@@ -327,14 +369,14 @@ void saveAdminPwd() {
 // ───────── Per-user passwords ─────────
 // config.h holds the factory defaults; each can be changed from the admin menu
 // and is then stored in NVS (key "upwd", the whole table in one blob). Guest
-// (index USER_COUNT) has no password and is never challenged.
-uint8_t userPwds[USER_COUNT][USER_PASSWORD_LEN] = USER_PASSWORDS;
+// (the virtual row at index userCount) has no password and is never challenged.
+uint8_t userPwds[MAX_USERS][USER_PASSWORD_LEN] = USER_PASSWORDS;
 
 // An all-zero password means "this user does not want one" — they start their
 // workout straight from the user list with no keypad. It costs 0000 as a usable
 // password, which is no loss given it is the first code anyone would try.
 bool userHasPwd(int u) {
-    if (u < 0 || u >= USER_COUNT) return false;      // Guest is never challenged
+    if (isGuestIdx(u)) return false;                 // Guest is never challenged
     for (int i = 0; i < USER_PASSWORD_LEN; i++)
         if (userPwds[u][i] != 0) return true;
     return false;
@@ -385,13 +427,52 @@ int adminWeightScroll = 0; // first visible row of the weights list — shared b
                            // always resolves to the user that was drawn there
 int adminPwdUser   = 0;   // user whose password is being changed
 int adminPwdScroll = 0;   // first visible row of the user-password list
-#define ADMIN_MENU_COUNT 4
+#define ADMIN_MENU_COUNT 5
 
 // Password edit (double entry to confirm; inactivity timeout = cancel)
 uint8_t       pwdNew[PWD_MAX_LEN] = {};
 uint8_t       pwdConfirmPhase = 0;       // 0 = first entry, 1 = re-enter
 unsigned long pwdEditLastKeyMs = 0;
 #define PWD_EDIT_TIMEOUT_MS 10000
+
+// ───────── User roster editing ─────────
+char nameBuf[USER_NAME_LEN] = {};
+int  namePos = 0;
+int  adminMgrUser = 0;
+int  adminMgrScroll = 0;
+bool deleteArmed = false;      // DEL is a two-tap action; this is the armed state
+
+void addUser(const char* name) {
+    if (userCount >= MAX_USERS) return;
+    strncpy(userNames[userCount], name, USER_NAME_LEN - 1);
+    userNames[userCount][USER_NAME_LEN - 1] = '\0';
+    userWeights[userCount] = DEFAULT_WEIGHT_KG;
+    memset(userPwds[userCount], 0, USER_PASSWORD_LEN);   // starts with no password
+    userCount++;
+    saveUsers(); saveWeights(); saveUserPwds();
+}
+
+// Removing a slot shifts everything above it down, so weights and passwords
+// have to travel with the name or they would end up on the wrong person.
+void deleteUser(int k) {
+    if (k < 0 || k >= userCount) return;
+    for (int i = k; i < userCount - 1; i++) {
+        memcpy(userNames[i], userNames[i + 1], USER_NAME_LEN);
+        userWeights[i] = userWeights[i + 1];
+        memcpy(userPwds[i], userPwds[i + 1], USER_PASSWORD_LEN);
+    }
+    userCount--;
+    memset(userNames[userCount], 0, USER_NAME_LEN);
+    userWeights[userCount] = DEFAULT_WEIGHT_KG;
+    memset(userPwds[userCount], 0, USER_PASSWORD_LEN);
+    saveUsers(); saveWeights(); saveUserPwds();
+
+    // Any index pointing past the end now selects Guest or nothing — pull them back.
+    if (currentUser  > userCount) currentUser  = userCount;
+    if (adminEditUser > userCount) adminEditUser = userCount;
+    if (adminPwdUser >= userCount) adminPwdUser = max(0, userCount - 1);
+    if (adminMgrUser >= userCount) adminMgrUser = max(0, userCount - 1);
+}
 
 // Hold the title bar on the idle screen to open admin.
 #define ADMIN_HOLD_MS 3000
@@ -401,7 +482,8 @@ enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_USER_AUTH, SCR_WORKOUT, SCR_PAUSED,
               SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY,
               SCR_CALIB_AUTH, SCR_ADMIN_MENU, SCR_CALIB,
               SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT, SCR_ADMIN_PWD_EDIT,
-              SCR_ADMIN_USERS, SCR_ADMIN_USER_PWD, SCR_ADMIN_OTP };
+              SCR_ADMIN_USERS, SCR_ADMIN_USER_PWD, SCR_ADMIN_OTP,
+              SCR_ADMIN_MANAGE, SCR_ADMIN_USER_NAME };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -697,7 +779,9 @@ enum BtnId {
     B_PREV, B_NEXT, B_SAVE, B_CANCEL, B_EXIT, B_EDIT,
     B_BRIGHT_DN, B_BRIGHT_UP,
     B_DEC_BIG, B_DEC, B_INC, B_INC_BIG,
-    B_SCROLL_UP, B_SCROLL_DN, B_FORGOT, B_NOPWD,
+    B_SCROLL_UP, B_SCROLL_DN, B_FORGOT, B_NOPWD, B_ADD, B_DELETE,
+    B_CHAR_SPACE, B_CHAR_A,   // B_CHAR_A..+25 must stay contiguous
+    B_CHAR_LAST = B_CHAR_A + 25,
     B_ROW0, B_ROW1, B_ROW2, B_ROW3, B_ROW4, B_ROW5, B_ROW6, B_ROW7, B_ROW8,
     B_KEY0, B_KEY1, B_KEY2, B_KEY3, B_KEY4,
     B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9,
@@ -712,7 +796,7 @@ struct Btn {
     bool     flat;      // list row: no rounded frame, highlight when selected
     bool     selected;
 };
-#define MAX_BTNS 16
+#define MAX_BTNS 36   // the letter keypad alone needs 30
 Btn  curBtns[MAX_BTNS];
 int  curBtnCount = 0;
 
@@ -1147,7 +1231,7 @@ bool uploadToNAS(uint32_t durSec) {
     doc["machine_sn"]      = MACHINE_SN;
     doc["machine_model"]   = MACHINE_MODEL;
     doc["date"]            = getTimestamp();
-    doc["user"]            = (currentUser < USER_COUNT) ? userNames[currentUser] : "Guest";
+    doc["user"]            = nameOf(currentUser);
     doc["duration_sec"]    = durSec;
     doc["distance_m"]      = totalMeters;
     doc["strokes"]         = strokeCount;
@@ -1165,7 +1249,7 @@ bool uploadToNAS(uint32_t durSec) {
 
     char filepath[128];
     struct tm ti;
-    const char* uname = (currentUser < USER_COUNT) ? userNames[currentUser] : "Guest";
+    const char* uname = nameOf(currentUser);
     if (getLocalTime(&ti, 200)) {
         snprintf(filepath, sizeof(filepath), "%s/%s_%04d%02d%02d_%02d%02d%02d.json",
             NAS_PATH, uname,
@@ -1491,7 +1575,7 @@ void drawSummaryScreen(bool uploadOk) {
 
     // Upload status
     int16_t sy = CONTENT_Y + 182;
-    if (currentUser == USER_COUNT) {
+    if (isGuestIdx(currentUser)) {
         drawIcon(UI_MARGIN, sy, bmp_happy, COL_WARN, 2);
         tft.setTextColor(COL_WARN, COL_BG);
     } else if (uploadOk) {
@@ -1503,7 +1587,7 @@ void drawSummaryScreen(bool uploadOk) {
     }
     tft.setTextSize(2);
     tft.setCursor(48, sy + 8);
-    tft.print(currentUser == USER_COUNT ? "Guest: BT only"
+    tft.print(isGuestIdx(currentUser) ? "Guest: BT only"
               : uploadOk ? "Saved to NAS!" : "Upload FAILED");
 
     beginBtns();
@@ -1587,7 +1671,7 @@ int16_t listRowY(int row) { return CONTENT_Y + 4 + row * LIST_ROW_H; }
 void drawUserSelectScreen() {
     drawHeader("WHO ARE YOU?");
 
-    int total = USER_COUNT + 1;                 // +1 for Guest
+    int total = userCount + 1;                  // +1 for Guest
     int vis   = min(listVisibleRows(), total);
     if (currentUser < userScrollOffset) userScrollOffset = currentUser;
     if (currentUser >= userScrollOffset + vis) userScrollOffset = currentUser - vis + 1;
@@ -1596,8 +1680,8 @@ void drawUserSelectScreen() {
     for (int row = 0; row < vis; row++) {
         int i = userScrollOffset + row;
         if (i >= total) break;
-        bool isGuest = (i == USER_COUNT);
-        const char* name = isGuest ? "Guest" : userNames[i];
+        bool isGuest = isGuestIdx(i);
+        const char* name = nameOf(i);
         int16_t y = listRowY(row);
         bool sel = (i == currentUser);
 
@@ -1615,7 +1699,7 @@ void drawUserSelectScreen() {
             tft.setTextColor(COL_DIVIDER, rowBg);
             tft.setCursor(TFT_WIDTH - UI_MARGIN - 40, y + (LIST_ROW_H - 4 - 8) / 2);
             // trailing * marks a user who will be asked for a password
-            tft.printf("%d/%d%s", i + 1, USER_COUNT, userHasPwd(i) ? " *" : "  ");
+            tft.printf("%d/%d%s", i + 1, userCount, userHasPwd(i) ? " *" : "  ");
         }
         addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
                nullptr, COL_ACCENT, true, sel);
@@ -1637,7 +1721,8 @@ void drawAdminMenuScreen() {
     drawHeader("ADMIN MENU");
 
     static const char* const items[ADMIN_MENU_COUNT] =
-        {"Calibration", "User Weights", "Admin Password", "User Passwords"};
+        {"Calibration", "User Weights", "Admin Password", "User Passwords",
+         "Manage Users"};
 
     beginBtns();
     for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
@@ -1660,7 +1745,7 @@ void drawAdminMenuScreen() {
 void drawAdminWeightsScreen() {
     drawHeader("USER WEIGHTS");
 
-    int total = USER_COUNT + 1;
+    int total = userCount + 1;
     int vis   = min(listVisibleRows(), total);
     if (adminEditUser < adminWeightScroll) adminWeightScroll = adminEditUser;
     if (adminEditUser >= adminWeightScroll + vis) adminWeightScroll = adminEditUser - vis + 1;
@@ -1669,8 +1754,7 @@ void drawAdminWeightsScreen() {
     for (int row = 0; row < vis; row++) {
         int i = adminWeightScroll + row;
         if (i >= total) break;
-        bool isGuest = (i == USER_COUNT);
-        const char* name = isGuest ? "Guest" : userNames[i];
+        const char* name = nameOf(i);
         int16_t y = listRowY(row);
         bool sel = (i == adminEditUser);
 
@@ -1685,7 +1769,7 @@ void drawAdminWeightsScreen() {
 
         tft.setTextColor(sel ? COL_VALUE : COL_DIVIDER, rowBg);
         tft.setCursor(TFT_WIDTH - UI_MARGIN - 68, y + (LIST_ROW_H - 4 - 16) / 2);
-        tft.printf("%3.0f", userWeights[i]);
+        tft.printf("%3.0f", weightOf(i));
         tft.setTextSize(1);
         tft.print("kg");
 
@@ -1698,8 +1782,7 @@ void drawAdminWeightsScreen() {
 }
 
 void drawAdminWeightEditScreen() {
-    bool isGuest = (adminEditUser == USER_COUNT);
-    const char* name = isGuest ? "Guest" : userNames[adminEditUser];
+    const char* name = nameOf(adminEditUser);
 
     drawHeader("EDIT WEIGHT");
 
@@ -1709,7 +1792,7 @@ void drawAdminWeightEditScreen() {
     tft.print(name);
 
     char buf[16];
-    snprintf(buf, sizeof(buf), "%3.0f", userWeights[adminEditUser]);
+    snprintf(buf, sizeof(buf), "%3.0f", weightOf(adminEditUser));
     tft.setTextSize(6);
     tft.setTextColor(COL_VALUE, COL_BG);
     tft.setCursor(30, CONTENT_Y + 44);
@@ -1874,14 +1957,14 @@ void drawUserAuthScreen() {
 void drawAdminUsersScreen() {
     drawHeader("USER PASSWORDS");
 
-    int vis = min(listVisibleRows(), USER_COUNT);
+    int vis = min(listVisibleRows(), userCount);
     if (adminPwdUser < adminPwdScroll) adminPwdScroll = adminPwdUser;
     if (adminPwdUser >= adminPwdScroll + vis) adminPwdScroll = adminPwdUser - vis + 1;
 
     beginBtns();
     for (int row = 0; row < vis; row++) {
         int i = adminPwdScroll + row;
-        if (i >= USER_COUNT) break;
+        if (i >= userCount) break;
         int16_t y = listRowY(row);
         bool sel = (i == adminPwdUser);
         uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
@@ -1926,6 +2009,99 @@ void drawAdminUserPwdScreen() {
 
     beginBtns();
     addKeypad(true);
+    drawAllBtns();
+}
+
+// ───────── Letter keypad (user names) ─────────
+// 6 x 5 grid: A-X fill the first four rows, Y/Z open the last one and the four
+// controls take the rest of it.
+#define CH_W   36
+#define CH_H   40
+#define CH_GAP 3
+#define CH_X0  ((TFT_WIDTH - CH_W * 6 - CH_GAP * 5) / 2)
+#define CH_Y0  (CONTENT_Y + 48)
+
+void addCharKeypad() {
+    static char lbl[26][2];
+    for (int i = 0; i < 26; i++) {
+        lbl[i][0] = 'A' + i; lbl[i][1] = '\0';
+        addBtn(B_CHAR_A + i,
+               CH_X0 + (i % 6) * (CH_W + CH_GAP),
+               CH_Y0 + (i / 6) * (CH_H + CH_GAP),
+               CH_W, CH_H, lbl[i], COL_TEXT);
+    }
+    int16_t y = CH_Y0 + 4 * (CH_H + CH_GAP);
+    addBtn(B_CHAR_SPACE, CH_X0 + 2 * (CH_W + CH_GAP), y, CH_W, CH_H, "_",  COL_LABEL);
+    addBtn(B_KEYDEL,     CH_X0 + 3 * (CH_W + CH_GAP), y, CH_W, CH_H, "<",  COL_WARN);
+    addBtn(B_KEYESC,     CH_X0 + 4 * (CH_W + CH_GAP), y, CH_W, CH_H, "X",  COL_ERROR);
+    addBtn(B_SAVE,       CH_X0 + 5 * (CH_W + CH_GAP), y, CH_W, CH_H, "OK", COL_VALUE);
+}
+
+void drawAdminUserNameScreen() {
+    drawHeader("NEW USER");
+
+    tft.setTextSize(1);
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+    tft.printf("Name (%d of %d max)", USER_NAME_LEN - 1, USER_NAME_LEN - 1);
+
+    tft.setTextSize(3);
+    tft.setTextColor(COL_VALUE, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 14);
+    tft.printf("%-8s", nameBuf);
+
+    beginBtns();
+    addCharKeypad();
+    drawAllBtns();
+}
+
+void drawAdminManageScreen() {
+    drawHeader("MANAGE USERS");
+
+    int vis = min(listVisibleRows(), userCount);
+    if (adminMgrUser < adminMgrScroll) adminMgrScroll = adminMgrUser;
+    if (adminMgrUser >= adminMgrScroll + vis) adminMgrScroll = adminMgrUser - vis + 1;
+
+    beginBtns();
+    if (userCount == 0) {
+        drawCentered(CONTENT_Y + 60, "No users yet", 2, COL_LABEL);
+        drawCentered(CONTENT_Y + 84, "ADD one to get started", 1, COL_DIVIDER);
+    }
+    for (int row = 0; row < vis; row++) {
+        int i = adminMgrScroll + row;
+        if (i >= userCount) break;
+        int16_t y = listRowY(row);
+        bool sel = (i == adminMgrUser);
+        uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
+
+        tft.fillRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, rowBg);
+        if (sel) tft.drawRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, COL_ACCENT);
+
+        tft.setTextSize(2);
+        tft.setTextColor(sel ? COL_ACCENT : COL_LABEL, rowBg);
+        tft.setCursor(UI_MARGIN + 12, y + (LIST_ROW_H - 4 - 16) / 2);
+        tft.print(userNames[i]);
+
+        tft.setTextSize(1);
+        tft.setTextColor(COL_DIVIDER, rowBg);
+        tft.setCursor(TFT_WIDTH - UI_MARGIN - 52, y + (LIST_ROW_H - 4 - 8) / 2);
+        tft.printf("%3.0fkg", weightOf(i));
+
+        addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
+               nullptr, COL_ACCENT, true, sel);
+    }
+
+    tft.setTextSize(1);
+    tft.setTextColor(deleteArmed ? COL_ERROR : COL_DIVIDER, COL_BG);
+    tft.setCursor(UI_MARGIN, BAR_Y - 12);
+    if (deleteArmed) tft.printf("Delete %s? tap SURE again  ", nameOf(adminMgrUser));
+    else             tft.printf("%d of %d slots used            ", userCount, MAX_USERS);
+
+    addBarBtn(B_BACK,   0, 3, "BACK", COL_LABEL);
+    addBarBtn(B_DELETE, 1, 3, deleteArmed ? "SURE" : "DEL",
+              deleteArmed ? COL_ERROR : COL_WARN);
+    addBarBtn(B_ADD,    2, 3, "ADD",
+              userCount < MAX_USERS ? COL_VALUE : COL_DIVIDER);
     drawAllBtns();
 }
 
@@ -2033,7 +2209,7 @@ void processSensor() {
         totalPulses = pulseCount;
         totalMeters += newPulses * calMetersPerPulse;
         // calories: weight-based estimate (~0.571 kcal per kg per km)
-        totalCalories = totalMeters * userWeights[currentUser] * 0.000571f;
+        totalCalories = totalMeters * weightOf(currentUser) * 0.000571f;
 
         unsigned long now = millis();
 
@@ -2189,7 +2365,7 @@ void handleInput() {
         break;
 
     case SCR_USER_SELECT: {
-        int total = USER_COUNT + 1;
+        int total = userCount + 1;
         int vis   = min(listVisibleRows(), total);
         if (touch.swipe) {                       // swipe scrolls the list
             userScrollOffset = constrain(userScrollOffset + touch.swipe * vis,
@@ -2207,7 +2383,7 @@ void handleInput() {
             beep(); currentScreen = SCR_IDLE;
         } else if (hit == B_START) {
             beep();
-            if (currentUser == USER_COUNT || !userHasPwd(currentUser)) {
+            if (isGuestIdx(currentUser) || !userHasPwd(currentUser)) {
                 startWorkout();                   // Guest, or password turned off
             } else {
                 pwdPos = 0; pwdWrong = false;
@@ -2361,9 +2537,12 @@ void handleInput() {
                 pwdPos = 0; pwdConfirmPhase = 0;
                 pwdEditLastKeyMs = millis();
                 currentScreen = SCR_ADMIN_PWD_EDIT;
-            } else {
+            } else if (adminMenuItem == 3) {
                 adminPwdUser = 0;
                 currentScreen = SCR_ADMIN_USERS;
+            } else {
+                adminMgrUser = 0; deleteArmed = false;
+                currentScreen = SCR_ADMIN_MANAGE;
             }
         } else if (hit == B_EXIT) {
             beep(); currentScreen = SCR_IDLE;
@@ -2390,7 +2569,7 @@ void handleInput() {
         break;
 
     case SCR_ADMIN_WEIGHTS: {
-        int total = USER_COUNT + 1;
+        int total = userCount + 1;
         if (touch.swipe) {
             int vis = min(listVisibleRows(), total);
             adminEditUser = constrain(adminEditUser + touch.swipe * vis, 0, total - 1);
@@ -2416,10 +2595,10 @@ void handleInput() {
 
     case SCR_ADMIN_WEIGHT_EDIT:
         switch (hit) {
-        case B_INC:     userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 1.0f); break;
-        case B_INC_BIG: userWeights[adminEditUser] = min(200.0f, userWeights[adminEditUser] + 5.0f); break;
-        case B_DEC:     userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 1.0f); break;
-        case B_DEC_BIG: userWeights[adminEditUser] = max(20.0f,  userWeights[adminEditUser] - 5.0f); break;
+        case B_INC:     setWeightOf(adminEditUser, min(200.0f, weightOf(adminEditUser) + 1.0f)); break;
+        case B_INC_BIG: setWeightOf(adminEditUser, min(200.0f, weightOf(adminEditUser) + 5.0f)); break;
+        case B_DEC:     setWeightOf(adminEditUser, max(20.0f,  weightOf(adminEditUser) - 1.0f)); break;
+        case B_DEC_BIG: setWeightOf(adminEditUser, max(20.0f,  weightOf(adminEditUser) - 5.0f)); break;
         case B_SAVE:
             saveWeights();
             playTone(TONE_UPLOAD, 200);
@@ -2435,15 +2614,15 @@ void handleInput() {
 
     case SCR_ADMIN_USERS:
         if (touch.swipe) {
-            int vis = min(listVisibleRows(), USER_COUNT);
-            adminPwdUser = constrain(adminPwdUser + touch.swipe * vis, 0, USER_COUNT - 1);
+            int vis = min(listVisibleRows(), userCount);
+            adminPwdUser = constrain(adminPwdUser + touch.swipe * vis, 0, max(0, userCount - 1));
             touch.swipe = 0;
             uiDirty = true;
             break;
         }
         if (hit >= B_ROW0 && hit <= B_ROW8) {
             int i = adminPwdScroll + (hit - B_ROW0);
-            if (i < USER_COUNT) {
+            if (i < userCount) {
                 beep();
                 if (i == adminPwdUser) {          // second tap opens the keypad
                     pwdPos = 0; pwdConfirmPhase = 0;
@@ -2498,6 +2677,63 @@ void handleInput() {
         }
         break;
     }
+
+    case SCR_ADMIN_MANAGE:
+        if (hit >= B_ROW0 && hit <= B_ROW8) {
+            int i = adminMgrScroll + (hit - B_ROW0);
+            if (i < userCount) { beep(); adminMgrUser = i; deleteArmed = false; }
+        } else if (hit == B_BACK) {
+            beep(); deleteArmed = false; currentScreen = SCR_ADMIN_MENU;
+        } else if (hit == B_ADD) {
+            if (userCount >= MAX_USERS) {
+                playTone(200, 300);              // roster full
+            } else {
+                beep();
+                memset(nameBuf, 0, sizeof(nameBuf)); namePos = 0;
+                deleteArmed = false;
+                currentScreen = SCR_ADMIN_USER_NAME;
+            }
+        } else if (hit == B_DELETE) {
+            if (userCount == 0) {
+                playTone(200, 300);
+            } else if (!deleteArmed) {
+                beep(); deleteArmed = true;       // first tap only arms it
+            } else {
+                deleteUser(adminMgrUser);
+                deleteArmed = false;
+                playTone(TONE_UPLOAD, 200);
+            }
+        }
+        break;
+
+    case SCR_ADMIN_USER_NAME:
+        if (hit >= B_CHAR_A && hit <= B_CHAR_LAST) {
+            if (namePos < USER_NAME_LEN - 1) {
+                beep();
+                nameBuf[namePos++] = 'A' + (hit - B_CHAR_A);
+                nameBuf[namePos] = '\0';
+            }
+        } else if (hit == B_CHAR_SPACE) {
+            if (namePos > 0 && namePos < USER_NAME_LEN - 1) {
+                beep();
+                nameBuf[namePos++] = ' ';
+                nameBuf[namePos] = '\0';
+            }
+        } else if (hit == B_KEYDEL) {
+            if (namePos > 0) { beep(); nameBuf[--namePos] = '\0'; }
+        } else if (hit == B_KEYESC) {
+            beep(); currentScreen = SCR_ADMIN_MANAGE;
+        } else if (hit == B_SAVE) {
+            if (namePos > 0) {
+                addUser(nameBuf);
+                playTone(TONE_UPLOAD, 200);
+                adminMgrUser = userCount - 1;
+                currentScreen = SCR_ADMIN_MANAGE;
+            } else {
+                playTone(200, 300);              // refuse an empty name
+            }
+        }
+        break;
 
     case SCR_ADMIN_PWD_EDIT: {
         int d = keyDigit(hit);
@@ -2568,6 +2804,8 @@ void drawCurrentScreen() {
         case SCR_ADMIN_USERS:       drawAdminUsersScreen(); break;
         case SCR_ADMIN_USER_PWD:    drawAdminUserPwdScreen(); break;
         case SCR_ADMIN_OTP:         drawAdminOtpScreen(); break;
+        case SCR_ADMIN_MANAGE:      drawAdminManageScreen(); break;
+        case SCR_ADMIN_USER_NAME:   drawAdminUserNameScreen(); break;
         default: break;
     }
 }
@@ -2678,6 +2916,7 @@ void setup() {
 #endif
 
     // Load saved calibration + admin password from NVS
+    loadUsers();
     loadCalibration();
     loadAdminPwd();
     loadUserPwds();
@@ -2716,7 +2955,7 @@ void loop() {
         uint32_t durSec = workoutElapsedMs / 1000;
         saveToHistory(durSec);
         bool ok = false;
-        if (currentUser == USER_COUNT) {
+        if (isGuestIdx(currentUser)) {
             // Guest: screen + BLE only, no NAS upload
             beep();
         } else {
