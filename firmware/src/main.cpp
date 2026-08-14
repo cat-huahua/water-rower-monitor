@@ -324,9 +324,58 @@ void saveAdminPwd() {
     prefs.end();
 }
 
-uint8_t pwdBuffer[CALIB_PASSWORD_LEN] = {};
+// ───────── Per-user passwords ─────────
+// config.h holds the factory defaults; each can be changed from the admin menu
+// and is then stored in NVS (key "upwd", the whole table in one blob). Guest
+// (index USER_COUNT) has no password and is never challenged.
+uint8_t userPwds[USER_COUNT][USER_PASSWORD_LEN] = USER_PASSWORDS;
+
+// An all-zero password means "this user does not want one" — they start their
+// workout straight from the user list with no keypad. It costs 0000 as a usable
+// password, which is no loss given it is the first code anyone would try.
+bool userHasPwd(int u) {
+    if (u < 0 || u >= USER_COUNT) return false;      // Guest is never challenged
+    for (int i = 0; i < USER_PASSWORD_LEN; i++)
+        if (userPwds[u][i] != 0) return true;
+    return false;
+}
+
+void loadUserPwds() {
+    prefs.begin("wrower", true);
+    if (prefs.getBytesLength("upwd") == sizeof(userPwds))
+        prefs.getBytes("upwd", userPwds, sizeof(userPwds));
+    prefs.end();
+}
+void saveUserPwds() {
+    prefs.begin("wrower", false);
+    prefs.putBytes("upwd", userPwds, sizeof(userPwds));
+    prefs.end();
+}
+
+// One entry buffer serves the admin, per-user and OTP keypads.
+#define PWD_MAX_LEN 8
+static_assert(CALIB_PASSWORD_LEN <= PWD_MAX_LEN, "admin password too long");
+static_assert(USER_PASSWORD_LEN  <= PWD_MAX_LEN, "user password too long");
+static_assert(OTP_LEN            <= PWD_MAX_LEN, "OTP too long");
+uint8_t pwdBuffer[PWD_MAX_LEN] = {};
 uint8_t pwdPos   = 0;
 bool    pwdWrong = false;
+
+// ───────── Admin password recovery (one-time code) ─────────
+// Issued only on request, kept in RAM (a reboot voids it), burned on use.
+uint8_t       otpCode[OTP_LEN] = {};
+unsigned long otpIssuedMs = 0;      // 0 = none outstanding
+bool          otpSendFailed = false;
+
+bool otpValid() {
+    return otpIssuedMs != 0 && (millis() - otpIssuedMs) < OTP_VALID_MS;
+}
+
+// True while the password editor was reached by OTP recovery rather than from
+// the admin menu. A valid OTP authorises exactly one thing — setting a new
+// admin password — so this sends the editor back to idle instead of into the
+// menu, and the rest of admin still requires the (new) password.
+bool otpRecovery = false;
 
 // ───────── Admin state ─────────
 int adminMenuItem  = 0;   // selected menu item
@@ -334,10 +383,12 @@ int adminEditUser  = 0;   // user being edited in weight screen
 int adminWeightScroll = 0; // first visible row of the weights list — shared by
                            // the drawing pass and the tap handler so a row tap
                            // always resolves to the user that was drawn there
-#define ADMIN_MENU_COUNT 3
+int adminPwdUser   = 0;   // user whose password is being changed
+int adminPwdScroll = 0;   // first visible row of the user-password list
+#define ADMIN_MENU_COUNT 4
 
 // Password edit (double entry to confirm; inactivity timeout = cancel)
-uint8_t       pwdNew[CALIB_PASSWORD_LEN] = {};
+uint8_t       pwdNew[PWD_MAX_LEN] = {};
 uint8_t       pwdConfirmPhase = 0;       // 0 = first entry, 1 = re-enter
 unsigned long pwdEditLastKeyMs = 0;
 #define PWD_EDIT_TIMEOUT_MS 10000
@@ -346,10 +397,11 @@ unsigned long pwdEditLastKeyMs = 0;
 #define ADMIN_HOLD_MS 3000
 
 // ───────── State machine ─────────
-enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_WORKOUT, SCR_PAUSED, SCR_SUMMARY,
-              SCR_UPLOADING, SCR_HISTORY,
+enum Screen { SCR_IDLE, SCR_USER_SELECT, SCR_USER_AUTH, SCR_WORKOUT, SCR_PAUSED,
+              SCR_SUMMARY, SCR_UPLOADING, SCR_HISTORY,
               SCR_CALIB_AUTH, SCR_ADMIN_MENU, SCR_CALIB,
-              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT, SCR_ADMIN_PWD_EDIT };
+              SCR_ADMIN_WEIGHTS, SCR_ADMIN_WEIGHT_EDIT, SCR_ADMIN_PWD_EDIT,
+              SCR_ADMIN_USERS, SCR_ADMIN_USER_PWD, SCR_ADMIN_OTP };
 Screen currentScreen = SCR_IDLE;
 int displayPage = 0;
 
@@ -645,7 +697,7 @@ enum BtnId {
     B_PREV, B_NEXT, B_SAVE, B_CANCEL, B_EXIT, B_EDIT,
     B_BRIGHT_DN, B_BRIGHT_UP,
     B_DEC_BIG, B_DEC, B_INC, B_INC_BIG,
-    B_SCROLL_UP, B_SCROLL_DN,
+    B_SCROLL_UP, B_SCROLL_DN, B_FORGOT, B_NOPWD,
     B_ROW0, B_ROW1, B_ROW2, B_ROW3, B_ROW4, B_ROW5, B_ROW6, B_ROW7, B_ROW8,
     B_KEY0, B_KEY1, B_KEY2, B_KEY3, B_KEY4,
     B_KEY5, B_KEY6, B_KEY7, B_KEY8, B_KEY9,
@@ -1053,6 +1105,39 @@ String getTimestamp() {
     return "1970-01-01T00:00:00Z";
 }
 
+// ───────── TrueNAS file write (plain HTTP, local network) ─────────
+// Shared by the workout upload and the admin OTP delivery — same endpoint,
+// same multipart envelope, only the path and payload differ.
+bool nasPutFile(const char* filepath, const char* formFilename, const String& content) {
+    String boundary = "WR32";
+    String meta = String("{\"path\":\"") + filepath + "\"}";
+    String body;
+    body.reserve(content.length() + 256);
+    body  = "--" + boundary + "\r\n";
+    body += "Content-Disposition: form-data; name=\"data\"\r\n\r\n";
+    body += meta + "\r\n";
+    body += "--" + boundary + "\r\n";
+    body += "Content-Disposition: form-data; name=\"file\"; filename=\"";
+    body += formFilename;
+    body += "\"\r\n";
+    body += "Content-Type: application/octet-stream\r\n\r\n";
+    body += content + "\r\n";
+    body += "--" + boundary + "--\r\n";
+
+    WiFiClient wc;
+    HTTPClient http;
+    http.setTimeout(10000);
+    http.begin(wc, "http://" NAS_HOST "/api/v2.0/filesystem/put");
+    http.addHeader("Authorization", "Bearer " NAS_API_KEY);
+    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+
+    Serial.printf("[NAS] -> %s\n", filepath);
+    int code = http.POST(body);
+    Serial.printf("[NAS] HTTP %d\n", code);
+    http.end();
+    return (code == 200);
+}
+
 // ───────── TrueNAS Upload (plain HTTP, local network) ─────────
 bool uploadToNAS(uint32_t durSec) {
     connectWiFi();
@@ -1090,31 +1175,30 @@ bool uploadToNAS(uint32_t durSec) {
         snprintf(filepath, sizeof(filepath), "%s/%s_%lu.json", NAS_PATH, uname, millis());
     }
 
-    String boundary = "WR32";
-    String meta = String("{\"path\":\"") + filepath + "\"}";
-    String body;
-    body.reserve(content.length() + 256);
-    body  = "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"data\"\r\n\r\n";
-    body += meta + "\r\n";
-    body += "--" + boundary + "\r\n";
-    body += "Content-Disposition: form-data; name=\"file\"; filename=\"workout.json\"\r\n";
-    body += "Content-Type: application/octet-stream\r\n\r\n";
-    body += content + "\r\n";
-    body += "--" + boundary + "--\r\n";
+    return nasPutFile(filepath, "workout.json", content);
+}
 
-    WiFiClient wc;
-    HTTPClient http;
-    http.setTimeout(10000);
-    http.begin(wc, "http://" NAS_HOST "/api/v2.0/filesystem/put");
-    http.addHeader("Authorization", "Bearer " NAS_API_KEY);
-    http.addHeader("Content-Type", "multipart/form-data; boundary=" + boundary);
+// Generates a fresh one-time code and writes it to the NAS. The code is only
+// ever readable there — nothing is shown on the device, otherwise anyone
+// standing at the machine could read it off the screen.
+bool issueOtp() {
+    for (int i = 0; i < OTP_LEN; i++) otpCode[i] = esp_random() % 10;
 
-    Serial.printf("[NAS] -> %s\n", filepath);
-    int code = http.POST(body);
-    Serial.printf("[NAS] HTTP %d\n", code);
-    http.end();
-    return (code == 200);
+    String body = "WaterRower " MACHINE_SN " - admin one-time code\n\n    ";
+    for (int i = 0; i < OTP_LEN; i++) { body += (char)('0' + otpCode[i]); body += ' '; }
+    body += "\n\nIssued: " + getTimestamp() + "\n";
+    body += "Valid for " + String(OTP_VALID_MS / 60000) + " minutes, single use.\n";
+
+    connectWiFi();
+    if (WiFi.status() != WL_CONNECTED) {
+        Serial.println("[OTP] no WiFi — cannot deliver");
+        otpIssuedMs = 0;
+        return false;
+    }
+    bool ok = nasPutFile(NAS_PATH "/" NAS_OTP_FILE, NAS_OTP_FILE, body);
+    otpIssuedMs = ok ? millis() : 0;
+    Serial.printf("[OTP] delivery %s\n", ok ? "ok" : "FAILED");
+    return ok;
 }
 
 // ───────── Drawing Helpers ─────────
@@ -1529,8 +1613,9 @@ void drawUserSelectScreen() {
         if (!isGuest) {
             tft.setTextSize(1);
             tft.setTextColor(COL_DIVIDER, rowBg);
-            tft.setCursor(TFT_WIDTH - UI_MARGIN - 34, y + (LIST_ROW_H - 4 - 8) / 2);
-            tft.printf("%d/%d", i + 1, USER_COUNT);
+            tft.setCursor(TFT_WIDTH - UI_MARGIN - 40, y + (LIST_ROW_H - 4 - 8) / 2);
+            // trailing * marks a user who will be asked for a password
+            tft.printf("%d/%d%s", i + 1, USER_COUNT, userHasPwd(i) ? " *" : "  ");
         }
         addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
                nullptr, COL_ACCENT, true, sel);
@@ -1552,7 +1637,7 @@ void drawAdminMenuScreen() {
     drawHeader("ADMIN MENU");
 
     static const char* const items[ADMIN_MENU_COUNT] =
-        {"Calibration", "User Weights", "Password"};
+        {"Calibration", "User Weights", "Admin Password", "User Passwords"};
 
     beginBtns();
     for (int i = 0; i < ADMIN_MENU_COUNT; i++) {
@@ -1666,10 +1751,11 @@ void addKeypad(bool withEscape) {
         addBtn(B_KEYESC, KEY_X0 + (KEY_W + KEY_GAP) * 2, y, KEY_W, KEY_H, "ESC", COL_ERROR);
 }
 
-// Row of dots showing how many digits are entered.
-void drawPwdDots(int16_t y) {
-    int16_t step = 34, x0 = (TFT_WIDTH - step * CALIB_PASSWORD_LEN) / 2;
-    for (int i = 0; i < CALIB_PASSWORD_LEN; i++) {
+// Row of dots showing how many digits are entered. x0 < 0 centres the row.
+void drawPwdDots(int16_t y, int len = CALIB_PASSWORD_LEN,
+                 int16_t step = 34, int16_t x0 = -1) {
+    if (x0 < 0) x0 = (TFT_WIDTH - step * len) / 2;
+    for (int i = 0; i < len; i++) {
         tft.setTextSize(3);
         tft.setTextColor(i < (int)pwdPos ? COL_ACCENT : COL_DIVIDER, COL_BG);
         tft.setCursor(x0 + i * step + 8, y);
@@ -1681,11 +1767,58 @@ void drawCalibAuthScreen() {
     drawHeader("ADMIN ACCESS");
 
     tft.setTextSize(1);
-    tft.setTextColor(pwdWrong ? COL_ERROR : COL_LABEL, COL_BG);
-    tft.setCursor(UI_MARGIN, CONTENT_Y + 6);
-    tft.print(pwdWrong ? "WRONG PASSWORD - try again" : "Enter password:      ");
+    if (otpSendFailed) {
+        tft.setTextColor(COL_ERROR, COL_BG);
+        tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+        tft.print("OTP send FAILED - check NAS/WiFi");
+    } else {
+        tft.setTextColor(pwdWrong ? COL_ERROR : COL_LABEL, COL_BG);
+        tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+        tft.print(pwdWrong ? "WRONG PASSWORD - try again      " : "Enter password:                 ");
+    }
 
-    drawPwdDots(CONTENT_Y + 24);
+    // Dots sit left so the recovery button can share the row.
+    drawPwdDots(CONTENT_Y + 16, CALIB_PASSWORD_LEN, 30, UI_MARGIN + 2);
+
+    beginBtns();
+    addBtn(B_FORGOT, 140, CONTENT_Y + 16, TFT_WIDTH - 140 - UI_MARGIN, 26,
+           "FORGOT", COL_WARN);
+    addKeypad(true);
+    drawAllBtns();
+}
+
+// Shown while the NAS write is in flight — it blocks for several seconds, and
+// an unexplained freeze reads as a crash.
+void drawOtpSendingScreen() {
+    tft.fillScreen(COL_BG);
+    drawHeader("ONE-TIME CODE");
+    drawIcon((TFT_WIDTH - 32) / 2, CONTENT_Y + 40, bmp_happy, COL_WARN, 2);
+    drawCentered(CONTENT_Y + 90,  "Sending code", 3, COL_WARN);
+    drawCentered(CONTENT_Y + 126, "to the NAS...", 2, COL_LABEL);
+    drawCentered(CONTENT_Y + 160, "connecting WiFi", 1, COL_DIVIDER);
+    beginBtns();
+}
+
+// Entered after a one-time code has been delivered to the NAS.
+void drawAdminOtpScreen() {
+    drawHeader("ONE-TIME CODE");
+
+    tft.setTextSize(1);
+    tft.setTextColor(pwdWrong ? COL_ERROR : COL_VALUE, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+    tft.print(pwdWrong ? "WRONG CODE - try again        "
+                       : "Code written to the NAS:      ");
+
+    tft.setTextColor(COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 12);
+    tft.print(NAS_OTP_FILE);
+
+    unsigned long left = otpValid() ? (OTP_VALID_MS - (millis() - otpIssuedMs)) / 1000 : 0;
+    tft.setTextColor(left > 30 ? COL_LABEL : COL_ERROR, COL_BG);
+    tft.setCursor(TFT_WIDTH - 64, CONTENT_Y + 12);
+    tft.printf("%2lu:%02lu ", left / 60, left % 60);
+
+    drawPwdDots(CONTENT_Y + 26, OTP_LEN, 30);
 
     beginBtns();
     addKeypad(true);
@@ -1693,14 +1826,103 @@ void drawCalibAuthScreen() {
 }
 
 void drawAdminPwdEditScreen() {
-    drawHeader("SET PASSWORD");
+    drawHeader(otpRecovery ? "RESET PASSWORD" : "SET PASSWORD");
+
+    // Recovery adds a banner line, so both notes sit above the dots and the
+    // keypad start (CONTENT_Y + 56) still clears them.
+    if (otpRecovery) {
+        tft.setTextSize(1);
+        tft.setTextColor(COL_VALUE, COL_BG);
+        tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+        tft.print("Code accepted - set a new password");
+    }
 
     tft.setTextSize(1);
     tft.setTextColor(pwdConfirmPhase ? COL_WARN : COL_LABEL, COL_BG);
-    tft.setCursor(UI_MARGIN, CONTENT_Y + 6);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 14);
     tft.print(pwdConfirmPhase ? "Re-enter to confirm: " : "Enter NEW password:  ");
 
-    drawPwdDots(CONTENT_Y + 24);
+    drawPwdDots(CONTENT_Y + 26);
+
+    beginBtns();
+    addKeypad(true);
+    drawAllBtns();
+}
+
+// Password challenge shown after picking a user, before the workout starts.
+void drawUserAuthScreen() {
+    drawHeader("PASSWORD");
+
+    tft.setTextSize(2);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+    tft.printf("%-12s", userNames[currentUser]);
+
+    tft.setTextSize(1);
+    tft.setTextColor(pwdWrong ? COL_ERROR : COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 24);
+    tft.print(pwdWrong ? "WRONG PASSWORD - try again" : "Enter your password:      ");
+
+    drawPwdDots(CONTENT_Y + 38, USER_PASSWORD_LEN);
+
+    beginBtns();
+    addKeypad(true);
+    drawAllBtns();
+}
+
+// Admin: pick whose password to change (Guest has none, so it is not listed).
+void drawAdminUsersScreen() {
+    drawHeader("USER PASSWORDS");
+
+    int vis = min(listVisibleRows(), USER_COUNT);
+    if (adminPwdUser < adminPwdScroll) adminPwdScroll = adminPwdUser;
+    if (adminPwdUser >= adminPwdScroll + vis) adminPwdScroll = adminPwdUser - vis + 1;
+
+    beginBtns();
+    for (int row = 0; row < vis; row++) {
+        int i = adminPwdScroll + row;
+        if (i >= USER_COUNT) break;
+        int16_t y = listRowY(row);
+        bool sel = (i == adminPwdUser);
+        uint16_t rowBg = sel ? COL_BTN_BG : COL_BG;
+
+        tft.fillRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, rowBg);
+        if (sel) tft.drawRect(UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4, COL_ACCENT);
+
+        tft.setTextSize(2);
+        tft.setTextColor(sel ? COL_ACCENT : COL_LABEL, rowBg);
+        tft.setCursor(UI_MARGIN + 12, y + (LIST_ROW_H - 4 - 16) / 2);
+        tft.print(userNames[i]);
+
+        bool has = userHasPwd(i);
+        tft.setTextSize(1);
+        tft.setTextColor(has ? COL_VALUE : COL_DIVIDER, rowBg);
+        tft.setCursor(TFT_WIDTH - UI_MARGIN - 46, y + (LIST_ROW_H - 4 - 8) / 2);
+        tft.print(has ? "**** " : "none ");
+
+        addBtn(B_ROW0 + row, UI_MARGIN, y, TFT_WIDTH - UI_MARGIN * 2, LIST_ROW_H - 4,
+               nullptr, COL_ACCENT, true, sel);
+    }
+    addBarBtn(B_BACK,  0, 3, "BACK", COL_LABEL);
+    addBarBtn(B_NOPWD, 1, 3, "NONE", COL_WARN);
+    addBarBtn(B_EDIT,  2, 3, "SET",  COL_ACCENT);
+    drawAllBtns();
+}
+
+void drawAdminUserPwdScreen() {
+    drawHeader("SET USER PWD");
+
+    tft.setTextSize(2);
+    tft.setTextColor(COL_ACCENT, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 2);
+    tft.printf("%-12s", userNames[adminPwdUser]);
+
+    tft.setTextSize(1);
+    tft.setTextColor(pwdConfirmPhase ? COL_WARN : COL_LABEL, COL_BG);
+    tft.setCursor(UI_MARGIN, CONTENT_Y + 24);
+    tft.print(pwdConfirmPhase ? "Re-enter to confirm: " : "Enter NEW password:  ");
+
+    drawPwdDots(CONTENT_Y + 38, USER_PASSWORD_LEN);
 
     beginBtns();
     addKeypad(true);
@@ -1923,17 +2145,27 @@ void enterAdmin() {
 }
 
 // Feeds one keypad digit into pwdBuffer; returns true when the buffer filled.
-bool pwdPushDigit(uint8_t digit) {
+bool pwdPushDigit(uint8_t digit, int len = CALIB_PASSWORD_LEN) {
     beep();
     pwdWrong = false;
-    if (pwdPos < CALIB_PASSWORD_LEN) pwdBuffer[pwdPos++] = digit;
-    return pwdPos >= CALIB_PASSWORD_LEN;
+    if (pwdPos < len) pwdBuffer[pwdPos++] = digit;
+    return pwdPos >= len;
 }
 
 // Maps a keypad button id to its digit, or -1 if it is not a digit key.
 int keyDigit(uint8_t id) {
     if (id >= B_KEY0 && id <= B_KEY9) return id - B_KEY0;
     return -1;
+}
+
+// Reached either straight from user select (Guest) or after the password
+// challenge — both paths must set the workout up identically.
+void startWorkout() {
+    resetWorkout();
+    workoutActive = true;
+    workoutStartMs = millis();
+    currentScreen = SCR_WORKOUT;
+    playTone(TONE_START, TONE_DURATION);
 }
 
 // ───────── Handle input ─────────
@@ -1975,11 +2207,34 @@ void handleInput() {
             beep(); currentScreen = SCR_IDLE;
         } else if (hit == B_START) {
             beep();
-            resetWorkout();
-            workoutActive = true;
-            workoutStartMs = millis();
-            currentScreen = SCR_WORKOUT;
-            playTone(TONE_START, TONE_DURATION);
+            if (currentUser == USER_COUNT || !userHasPwd(currentUser)) {
+                startWorkout();                   // Guest, or password turned off
+            } else {
+                pwdPos = 0; pwdWrong = false;
+                currentScreen = SCR_USER_AUTH;
+            }
+        }
+        break;
+    }
+
+    case SCR_USER_AUTH: {
+        int d = keyDigit(hit);
+        if (d >= 0) {
+            if (pwdPushDigit((uint8_t)d, USER_PASSWORD_LEN)) {
+                bool ok = memcmp(pwdBuffer, userPwds[currentUser], USER_PASSWORD_LEN) == 0;
+                pwdPos = 0;
+                if (ok) {
+                    startWorkout();
+                } else {
+                    pwdWrong = true;
+                    playTone(200, 300);
+                }
+            }
+        } else if (hit == B_KEYDEL) {
+            beep(); if (pwdPos > 0) pwdPos--;
+        } else if (hit == B_KEYESC) {
+            beep(); pwdPos = 0; pwdWrong = false;
+            currentScreen = SCR_USER_SELECT;
         }
         break;
     }
@@ -2042,7 +2297,56 @@ void handleInput() {
         } else if (hit == B_KEYDEL) {
             beep(); if (pwdPos > 0) pwdPos--;
         } else if (hit == B_KEYESC) {
-            beep(); pwdPos = 0; pwdWrong = false; currentScreen = SCR_IDLE;
+            beep(); pwdPos = 0; pwdWrong = false; otpSendFailed = false;
+            currentScreen = SCR_IDLE;
+        } else if (hit == B_FORGOT) {
+            beep();
+            drawOtpSendingScreen();          // the NAS write blocks for seconds
+            pwdPos = 0; pwdWrong = false;
+            if (issueOtp()) {
+                otpSendFailed = false;
+                currentScreen = SCR_ADMIN_OTP;
+            } else {
+                otpSendFailed = true;        // stay put, explain on the password screen
+            }
+            uiDirty = true;
+        }
+        break;
+    }
+
+    case SCR_ADMIN_OTP: {
+        // Checked first and with a break: a successful entry below zeroes
+        // otpIssuedMs to burn the code, and a trailing check would then read
+        // that as "expired" and bounce us straight back out of admin.
+        if (!otpValid()) {
+            pwdPos = 0; pwdWrong = false;
+            uiDirty = true;
+            currentScreen = SCR_CALIB_AUTH;
+            break;
+        }
+        int d = keyDigit(hit);
+        if (d >= 0) {
+            if (pwdPushDigit((uint8_t)d, OTP_LEN)) {
+                bool ok = otpValid() && memcmp(pwdBuffer, otpCode, OTP_LEN) == 0;
+                pwdPos = 0;
+                if (ok) {
+                    otpIssuedMs = 0;                 // burn it
+                    memset(otpCode, 0, sizeof(otpCode));
+                    playTone(1600, 100);
+                    otpRecovery = true;              // only the password, nothing else
+                    pwdConfirmPhase = 0;
+                    pwdEditLastKeyMs = millis();
+                    currentScreen = SCR_ADMIN_PWD_EDIT;
+                } else {
+                    pwdWrong = true;
+                    playTone(200, 300);
+                }
+            }
+        } else if (hit == B_KEYDEL) {
+            beep(); if (pwdPos > 0) pwdPos--;
+        } else if (hit == B_KEYESC) {
+            beep(); pwdPos = 0; pwdWrong = false;
+            currentScreen = SCR_CALIB_AUTH;
         }
         break;
     }
@@ -2053,10 +2357,13 @@ void handleInput() {
             adminMenuItem = hit - B_ROW0;
             if (adminMenuItem == 0) currentScreen = SCR_CALIB;
             else if (adminMenuItem == 1) { adminEditUser = 0; currentScreen = SCR_ADMIN_WEIGHTS; }
-            else {
+            else if (adminMenuItem == 2) {
                 pwdPos = 0; pwdConfirmPhase = 0;
                 pwdEditLastKeyMs = millis();
                 currentScreen = SCR_ADMIN_PWD_EDIT;
+            } else {
+                adminPwdUser = 0;
+                currentScreen = SCR_ADMIN_USERS;
             }
         } else if (hit == B_EXIT) {
             beep(); currentScreen = SCR_IDLE;
@@ -2126,6 +2433,72 @@ void handleInput() {
         }
         break;
 
+    case SCR_ADMIN_USERS:
+        if (touch.swipe) {
+            int vis = min(listVisibleRows(), USER_COUNT);
+            adminPwdUser = constrain(adminPwdUser + touch.swipe * vis, 0, USER_COUNT - 1);
+            touch.swipe = 0;
+            uiDirty = true;
+            break;
+        }
+        if (hit >= B_ROW0 && hit <= B_ROW8) {
+            int i = adminPwdScroll + (hit - B_ROW0);
+            if (i < USER_COUNT) {
+                beep();
+                if (i == adminPwdUser) {          // second tap opens the keypad
+                    pwdPos = 0; pwdConfirmPhase = 0;
+                    pwdEditLastKeyMs = millis();
+                    currentScreen = SCR_ADMIN_USER_PWD;
+                } else {
+                    adminPwdUser = i;
+                }
+            }
+        } else if (hit == B_BACK) {
+            beep(); currentScreen = SCR_ADMIN_MENU;
+        } else if (hit == B_EDIT) {
+            beep();
+            pwdPos = 0; pwdConfirmPhase = 0;
+            pwdEditLastKeyMs = millis();
+            currentScreen = SCR_ADMIN_USER_PWD;
+        } else if (hit == B_NOPWD) {
+            memset(userPwds[adminPwdUser], 0, USER_PASSWORD_LEN);
+            saveUserPwds();
+            playTone(TONE_UPLOAD, 200);        // this user now starts unchallenged
+        }
+        break;
+
+    case SCR_ADMIN_USER_PWD: {
+        int d = keyDigit(hit);
+        if (d >= 0) {
+            pwdEditLastKeyMs = millis();
+            if (pwdPushDigit((uint8_t)d, USER_PASSWORD_LEN)) {
+                pwdPos = 0;
+                if (pwdConfirmPhase == 0) {
+                    memcpy(pwdNew, pwdBuffer, USER_PASSWORD_LEN);
+                    pwdConfirmPhase = 1;
+                } else if (memcmp(pwdNew, pwdBuffer, USER_PASSWORD_LEN) == 0) {
+                    memcpy(userPwds[adminPwdUser], pwdNew, USER_PASSWORD_LEN);
+                    saveUserPwds();
+                    playTone(TONE_UPLOAD, 200);   // saved
+                    currentScreen = SCR_ADMIN_USERS;
+                } else {
+                    playTone(200, 300);           // mismatch: start over
+                    pwdConfirmPhase = 0;
+                }
+            }
+        } else if (hit == B_KEYDEL) {
+            beep(); pwdEditLastKeyMs = millis(); if (pwdPos > 0) pwdPos--;
+        } else if (hit == B_KEYESC) {
+            beep(); currentScreen = SCR_ADMIN_USERS;   // cancel, keep old password
+        }
+        if (millis() - pwdEditLastKeyMs > PWD_EDIT_TIMEOUT_MS) {
+            beep();
+            uiDirty = true;
+            currentScreen = SCR_ADMIN_USERS;
+        }
+        break;
+    }
+
     case SCR_ADMIN_PWD_EDIT: {
         int d = keyDigit(hit);
         if (d >= 0) {
@@ -2139,7 +2512,10 @@ void handleInput() {
                     memcpy(adminPwd, pwdNew, CALIB_PASSWORD_LEN);
                     saveAdminPwd();
                     playTone(TONE_UPLOAD, 200);   // saved
-                    currentScreen = SCR_ADMIN_MENU;
+                    // After a recovery the new password has to be used to get
+                    // in; the OTP itself never grants the rest of admin.
+                    currentScreen = otpRecovery ? SCR_IDLE : SCR_ADMIN_MENU;
+                    otpRecovery = false;
                 } else {
                     playTone(200, 300);           // mismatch: start over
                     pwdConfirmPhase = 0;
@@ -2148,12 +2524,15 @@ void handleInput() {
         } else if (hit == B_KEYDEL) {
             beep(); pwdEditLastKeyMs = millis(); if (pwdPos > 0) pwdPos--;
         } else if (hit == B_KEYESC) {
-            beep(); currentScreen = SCR_ADMIN_MENU;   // cancel, keep old password
+            beep();                                   // cancel, keep old password
+            currentScreen = otpRecovery ? SCR_IDLE : SCR_ADMIN_MENU;
+            otpRecovery = false;
         }
         if (millis() - pwdEditLastKeyMs > PWD_EDIT_TIMEOUT_MS) {
             beep();                                   // idle timeout = cancel
             uiDirty = true;
-            currentScreen = SCR_ADMIN_MENU;
+            currentScreen = otpRecovery ? SCR_IDLE : SCR_ADMIN_MENU;
+            otpRecovery = false;
         }
         break;
     }
@@ -2176,6 +2555,7 @@ void drawCurrentScreen() {
     switch (currentScreen) {
         case SCR_IDLE:        drawIdleScreen(); break;
         case SCR_USER_SELECT: drawUserSelectScreen(); break;
+        case SCR_USER_AUTH:   drawUserAuthScreen(); break;
         case SCR_WORKOUT:     drawWorkoutScreen(); break;
         case SCR_PAUSED:      drawPausedScreen(); break;
         case SCR_HISTORY:     drawHistoryScreen(); break;
@@ -2185,6 +2565,9 @@ void drawCurrentScreen() {
         case SCR_ADMIN_WEIGHTS:     drawAdminWeightsScreen(); break;
         case SCR_ADMIN_WEIGHT_EDIT: drawAdminWeightEditScreen(); break;
         case SCR_ADMIN_PWD_EDIT:    drawAdminPwdEditScreen(); break;
+        case SCR_ADMIN_USERS:       drawAdminUsersScreen(); break;
+        case SCR_ADMIN_USER_PWD:    drawAdminUserPwdScreen(); break;
+        case SCR_ADMIN_OTP:         drawAdminOtpScreen(); break;
         default: break;
     }
 }
@@ -2198,7 +2581,7 @@ void refreshDisplay() {
 
     // Screens with live data; everything else redraws only on input/transition
     bool needsPeriodicRefresh = (currentScreen == SCR_WORKOUT || currentScreen == SCR_PAUSED ||
-                                 currentScreen == SCR_IDLE);
+                                 currentScreen == SCR_IDLE   || currentScreen == SCR_ADMIN_OTP);
 
     if (!needsClear && (!needsPeriodicRefresh || millis() - lastRedraw < REDRAW_MS)) {
         // Nothing to repaint except the press highlight on the current buttons.
@@ -2297,6 +2680,7 @@ void setup() {
     // Load saved calibration + admin password from NVS
     loadCalibration();
     loadAdminPwd();
+    loadUserPwds();
 
     // BLE FTMS
     initBLE();

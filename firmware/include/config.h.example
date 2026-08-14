@@ -58,12 +58,14 @@
 #define TOUCH_ADDR_CST328   0x1A     // V1 boards
 #define TOUCH_ADDR_CST3530  0x58     // V2 boards
 #define TOUCH_I2C_HZ    400000
-// Panel-to-screen orientation. These defaults match the Waveshare reference
-// configuration (no swap, no mirror) at TFT_ROTATION 0. If taps land mirrored
-// or on the wrong axis, flip the matching flag — nothing else needs changing.
+// Panel-to-screen orientation, set from testing on a real V2 board: both axes
+// mirror, i.e. the CST3530's origin is at the diagonally opposite corner from
+// the display's — the touch layer is effectively rotated 180° against the
+// panel. A V1 (CST328) board may well need these back at false; flip whichever
+// flag misbehaves, nothing else needs changing.
 #define TOUCH_SWAP_XY   false
-#define TOUCH_MIRROR_X  false
-#define TOUCH_MIRROR_Y  false
+#define TOUCH_MIRROR_X  true
+#define TOUCH_MIRROR_Y  true
 // Tap qualification
 #define TAP_MIN_MS      30    // shorter contact = noise
 #define TAP_MAX_DRIFT   35    // px of movement still counted as a tap, not a drag
@@ -138,6 +140,15 @@
 #define CALIB_REQUIRE_PASSWORD 0
 #define CALIB_PASSWORD     {3,2,1,0}           // factory default; changeable in admin
 #define CALIB_PASSWORD_LEN 4
+
+// ===== Admin password recovery (OTP) =====
+// Forgot the admin password? The FORGOT button on the password screen makes the
+// device generate a one-time code and write it to the NAS, then accept it in
+// place of the password. Being able to read the NAS is the recovery credential.
+// The code lives in RAM only — a reboot voids it — and is burned after one use.
+#define OTP_LEN        6
+#define OTP_VALID_MS   300000                  // 5 minutes
+#define NAS_OTP_FILE   "admin_otp.txt"
 
 // ===== Calibration =====
 #define PULSES_PER_REV      60                  // 60 teeth -> 60 pulses per paddle revolution
